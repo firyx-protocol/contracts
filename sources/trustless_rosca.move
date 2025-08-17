@@ -1,68 +1,92 @@
-module retamifi::rosca_core {
+module retamifi::trustless_rosca {
     use std::signer;
     use std::vector;
-    use std::option::{Self, Option};
-    use std::string::{String};
+    use std::option::{Self};
+    use std::string::{Self, String};
     use aptos_framework::coin::{Self, Coin};
     use aptos_framework::aptos_coin::AptosCoin;
     use aptos_framework::timestamp;
     use aptos_framework::event;
+    use aptos_framework::object::{Self};
 
-    /// Error: Caller is not authorized to perform this action
+    use aptos_token_objects::collection;
+    use aptos_token_objects::token;
+
+    // === CONSTANTS ===
+    
+    /// User is not authorized to perform this action
     const E_NOT_AUTHORIZED: u64 = 1;
-
-    /// Error: Pool does not exist at the given address
+    /// Pool was not found
     const E_POOL_NOT_FOUND: u64 = 2;
-
-    /// Error: Pool size is invalid (too small, too large, or inconsistent)
+    /// Pool size is invalid (must be between MIN_POOL_SIZE and MAX_POOL_SIZE)
     const E_INVALID_POOL_SIZE: u64 = 3;
-
-    /// Error: Insufficient funds for the requested operation
+    /// Insufficient funds for the operation
     const E_INSUFFICIENT_FUNDS: u64 = 4;
-
-    /// Error: Attempted to activate a pool that is already active
+    /// Pool is already active
     const E_POOL_ALREADY_ACTIVE: u64 = 5;
-
-    /// Error: Member not found in the pool
+    /// Member not found in the pool
     const E_MEMBER_NOT_FOUND: u64 = 6;
-
-    /// Error: Invalid member position/index in pool
+    /// Invalid position index
     const E_INVALID_POSITION: u64 = 7;
-
-    /// Error: Pool not ready for the requested operation (e.g., distribution too early)
+    /// Pool is not ready for this operation
     const E_POOL_NOT_READY: u64 = 8;
+    /// Auction has already ended
+    const E_AUCTION_ENDED: u64 = 9;
+    /// Bid amount is too low
+    const E_BID_TOO_LOW: u64 = 10;
+    /// Auction is not currently active
+    const E_AUCTION_NOT_ACTIVE: u64 = 11;
+    /// No winner found for the auction
+    const E_NO_WINNER: u64 = 12;
 
     const SECONDS_PER_MONTH: u64 = 2592000;
     const MIN_POOL_SIZE: u8 = 3;
     const MAX_POOL_SIZE: u8 = 10;
     const PRECISION: u64 = 10000;
 
-    struct MemberInfo has copy, drop, store {
-        address: address,
-        locked_amount: u64,
-        position: u8,
+    // === STRUCTS ===
+
+    struct Bid has copy, drop, store {
+        bidder: address,
+        amount: u64,
+    }
+
+    struct Position has copy, drop, store {
+        index: u8,
+        order_token_addr: address,
+        funded: bool,
         has_received_yield: bool,
-        join_time: u64,
-        boost_contributions: u64,
     }
 
     struct BoosterInfo has copy, drop, store {
-    address: address,
-    boost_amount: u64,
+        address: address,
+        boost_amount: u64,
     }
 
     struct CommonFundPool has key {
         pool_id: u64,
         creator: address,
-        members: vector<MemberInfo>,
-        total_locked: u64,
-        current_cycle: u8,
-        cycle_duration: u64,
+        target_size: u8,
+        contribution_per_member: u64,
+        total_locked_required: u64,
+
+        current_position: u8,
+        auction_end_time: u64,
+        auction_duration: u64,
+        bids: vector<Bid>,
+        auction_highest_bidder: address,
+        auction_highest_bid: u64,
+        bid_vault: Coin<AptosCoin>,
+
+        collection_name: String,
+        positions: vector<Position>,
+
         pool_balance: Coin<AptosCoin>,
-        strategy_id: String,
+        boost_percentage: u64,
         boosters: vector<BoosterInfo>,
-        boost_percentage: u64, // e.g., 1000 = 10% (PRECISION = 10000)
-        creation_time: u64,
+
+        cycle_duration: u64,
+        current_cycle: u8,
         last_distribution_time: u64,
         is_active: bool,
         completed: bool,
@@ -71,16 +95,29 @@ module retamifi::rosca_core {
     struct PoolRegistry has key {
         next_pool_id: u64,
         total_pools: u64,
-        active_pools: u64,
     }
 
     #[event]
     struct PoolCreatedEvent has drop, store {
         pool_id: u64,
         creator: address,
-        member_count: u8,
-        total_amount: u64,
-        strategy_id: String,
+        target_size: u8,
+    }
+
+    #[event]
+    struct BidEvent has drop, store {
+        pool_id: u64,
+        bidder: address,
+        amount: u64,
+        position: u8,
+    }
+
+    #[event]
+    struct OrderMintedEvent has drop, store {
+        pool_id: u64,
+        position: u8,
+        winner: address,
+        amount: u64,
     }
 
     #[event]
@@ -99,278 +136,407 @@ module retamifi::rosca_core {
         cycle: u8,
     }
 
+    // === INITIALIZATION ===
+
     fun init_module(admin: &signer) {
-        move_to(admin, PoolRegistry {
-            next_pool_id: 1,
-            total_pools: 0,
-            active_pools: 0,
+        move_to(admin, PoolRegistry { 
+            next_pool_id: 1, 
+            total_pools: 0 
         });
     }
 
+    // === UTILITY FUNCTIONS ===
+
+    fun make_collection_name(pool_id: u64): String {
+        let prefix = string::utf8(b"Trustless ROSCA Pool #");
+        let id_str = int_to_string_u64(pool_id);
+        prefix.append(id_str);
+        prefix
+    }
+
+    fun int_to_string_u64(n: u64): String {
+        if (n == 0) { 
+            return string::utf8(b"0")
+        };
+        
+        let digits = vector::empty<u8>();
+        let n_copy = n;
+        while (n_copy > 0) {
+            let d = ((n_copy % 10) as u8) + 48u8;
+            digits.push_back(d);
+            n_copy /= 10;
+        };
+        
+        let len = digits.length();
+        let i = 0;
+        let out = vector::empty<u8>();
+        while (i < len) {
+            let ch = digits[len - 1 - i];
+            out.push_back(ch);
+            i += 1;
+        };
+        string::utf8(out)
+    }
+
+    fun make_order_name(index: u8): String {
+        let prefix = string::utf8(b"Order #");
+        let idx_str = int_to_string_u64((index as u64));
+        prefix.append(idx_str);
+        prefix
+    }
+
+    fun all_positions_funded(positions: &vector<Position>): bool {
+        let len = positions.length();
+        let i = 0;
+        while (i < len) {
+            let position = positions.borrow(i);
+            if (!position.funded) { 
+                return false 
+            };
+            i += 1;
+        };
+        true
+    }
+
+    // === POOL MANAGEMENT ===
+
     public entry fun create_pool(
         creator: &signer,
-        member_addresses: vector<address>,
+        target_size: u8,
         contribution_per_member: u64,
-        strategy_id: String,
         cycle_duration_months: u64,
         boost_percentage: u64,
+        auction_duration_secs: u64,
     ) acquires PoolRegistry {
         let creator_addr = signer::address_of(creator);
-        let member_count = member_addresses.length();
-        
-        // Validations
-        assert!(member_count >= (MIN_POOL_SIZE as u64) && member_count <= (MAX_POOL_SIZE as u64), E_INVALID_POOL_SIZE);
-        
-        // Get next pool ID
+        assert!(target_size >= MIN_POOL_SIZE && target_size <= MAX_POOL_SIZE, E_INVALID_POOL_SIZE);
+        assert!(boost_percentage <= PRECISION, E_INVALID_POOL_SIZE);
+
         let registry = borrow_global_mut<PoolRegistry>(@retamifi);
         let pool_id = registry.next_pool_id;
         registry.next_pool_id += 1;
         registry.total_pools += 1;
 
-        // Create member list
-        let members = vector::empty<MemberInfo>();
-        let i = 0;
-        while (i < member_count) {
-            let member_addr = member_addresses[i];
-            let member = MemberInfo {
-                address: member_addr,
-                locked_amount: contribution_per_member,
-                position: (i + 1) as u8,
-                has_received_yield: false,
-                join_time: timestamp::now_seconds(),
-                boost_contributions: 0,
-            };
-            members.push_back(member);
-            i += 1;
-        };
+        let collection_name = make_collection_name(pool_id);
 
-        // Create pool resource
+        collection::create_unlimited_collection(
+            creator,
+            string::utf8(b"ROSCA Order NFTs"),
+            collection_name,
+            option::none(),
+            string::utf8(b"https://retamifi.com/nft/")
+        );
+
         let pool = CommonFundPool {
             pool_id,
             creator: creator_addr,
-            members,
-            total_locked: contribution_per_member * member_count,
-            current_cycle: 0,
-            cycle_duration: cycle_duration_months * SECONDS_PER_MONTH,
+            target_size,
+            contribution_per_member,
+            total_locked_required: (contribution_per_member * (target_size as u64)),
+
+            current_position: 0,
+            auction_end_time: timestamp::now_seconds() + auction_duration_secs,
+            auction_duration: auction_duration_secs,
+            bids: vector::empty<Bid>(),
+            auction_highest_bidder: @0x0,
+            auction_highest_bid: 0,
+            bid_vault: coin::zero<AptosCoin>(),
+
+            collection_name,
+            positions: vector::empty<Position>(),
+
             pool_balance: coin::zero<AptosCoin>(),
-            strategy_id,
-            boosters: vector::empty<BoosterInfo>(),
             boost_percentage,
-            creation_time: timestamp::now_seconds(),
+            boosters: vector::empty<BoosterInfo>(),
+
+            cycle_duration: cycle_duration_months * SECONDS_PER_MONTH,
+            current_cycle: 0,
             last_distribution_time: 0,
             is_active: false,
             completed: false,
         };
 
-        // Emit event
         event::emit(PoolCreatedEvent {
             pool_id,
             creator: creator_addr,
-            member_count: (member_count as u8),
-            total_amount: contribution_per_member * member_count,
-            strategy_id,
+            target_size
         });
 
-        // Move pool resource to creator's account
         move_to(creator, pool);
     }
 
-    public entry fun lock_funds(
-        member: &signer,
-        pool_creator: address,
-        amount: u64,
-    ) acquires CommonFundPool {
-        let member_addr = signer::address_of(member);
-        let pool = borrow_global_mut<CommonFundPool>(pool_creator);
-        
-        // Find member in pool
-        let member_index = find_member_index(pool, member_addr);
-        assert!(member_index.is_some(), E_MEMBER_NOT_FOUND);
-        
-        let index = member_index.extract();
-        let member_info = pool.members.borrow(index);
-        
-        // Validate amount
-        assert!(amount == member_info.locked_amount, E_INSUFFICIENT_FUNDS);
-        
-        // Transfer coins to pool
-        let coins = coin::withdraw<AptosCoin>(member, amount);
-        coin::merge(&mut pool.pool_balance, coins);
-        
-        // Check if all members have locked funds
-        if (coin::value(&pool.pool_balance) == pool.total_locked) {
-            pool.is_active = true;
-            pool.last_distribution_time = timestamp::now_seconds();
-        };
-    }
-
-    public entry fun claim_yield(
-        pool_creator: address,
-        total_yield: u64,
-    ) acquires CommonFundPool {
-        let pool = borrow_global_mut<CommonFundPool>(pool_creator);
-        assert!(pool.is_active && !pool.completed, E_POOL_NOT_READY);
-        
-        // Check if it's time for next distribution
-        let current_time = timestamp::now_seconds();
-        assert!(current_time >= pool.last_distribution_time + pool.cycle_duration, E_POOL_NOT_READY);
-        
-        // Get current cycle recipient (main member)
-        let current_cycle = pool.current_cycle;
-        let main_member_addr = pool.members[(current_cycle as u64)].address;
-        
-        let main_share: u64;
-        
-        // Check if there are boosters
-        if (pool.boosters.is_empty()) {
-            // No boosters - main member gets 100% yield
-            main_share = total_yield;
-        } else {
-            let total_boost_share: u64;
-            // Has boosters - calculate cut
-            total_boost_share = (total_yield * pool.boost_percentage) / PRECISION;
-            main_share = total_yield - total_boost_share;
-            
-            // Distribute boost share among boosters proportionally
-            distribute_boost_share(pool, total_boost_share);
-        };
-        
-        // Transfer main share to primary recipient
-        if (main_share > 0) {
-            let main_coins = coin::extract(&mut pool.pool_balance, main_share);
-            coin::deposit(main_member_addr, main_coins);
-            
-            // Emit event for main distribution
-            event::emit(YieldDistributedEvent {
-                pool_id: pool.pool_id,
-                recipient: main_member_addr,
-                amount: main_share,
-                cycle: current_cycle + 1,
-            });
-        };
-
-        let main_member = pool.members.borrow_mut((current_cycle as u64));
-
-        // Update member status
-        main_member.has_received_yield = true;
-        
-        // Reset boosters for next cycle
-        pool.boosters = vector::empty<BoosterInfo>();
-        
-        // Move to next cycle
-        pool.current_cycle += 1;
-        pool.last_distribution_time = current_time;
-        
-        // Check if pool is completed
-        if (pool.current_cycle >= (pool.members.length() as u8)) {
-            complete_pool(pool);
-        };
-    }
-
-    public entry fun boost(
-        booster: &signer,
-        pool_creator: address,
-        boost_amount: u64,
-    ) acquires CommonFundPool {
-        let booster_addr = signer::address_of(booster);
-        let pool = borrow_global_mut<CommonFundPool>(pool_creator);
-        
-        assert!(pool.is_active && !pool.completed, E_POOL_NOT_READY);
-        
-        // Ensure booster is not the current cycle recipient
-        let current_recipient = pool.members.borrow((pool.current_cycle as u64));
-        assert!(booster_addr != current_recipient.address, E_NOT_AUTHORIZED);
-        
-        // Verify booster is a pool member
-        let booster_index = find_member_index(pool, booster_addr);
-        assert!(booster_index.is_some(), E_MEMBER_NOT_FOUND);
-        
-        // Add boost contribution
-        let boost_coins = coin::withdraw<AptosCoin>(booster, boost_amount);
-        coin::merge(&mut pool.pool_balance, boost_coins);
-        
-        // Add to boosters list
-        let booster_info = BoosterInfo {
-            address: booster_addr,
-            boost_amount,
-        };
-        pool.boosters.push_back(booster_info);
-        
-        // Emit event
-        event::emit(BoostEvent {
-            pool_id: pool.pool_id,
-            booster: booster_addr,
-            amount: boost_amount,
-            cycle: pool.current_cycle,
-        });
-    }
-
-    fun distribute_boost_share(pool: &mut CommonFundPool, total_boost_share: u64) {
-        if (total_boost_share == 0 || pool.boosters.is_empty()) {
-            return
-        };
-        
-        // Calculate total boost amount to determine proportions
-        let total_boost_amount = 0u64;
-        let i = 0;
-        let boosters_len = pool.boosters.length();
-        
-        while (i < boosters_len) {
-            let booster = pool.boosters.borrow(i);
-            total_boost_amount += booster.boost_amount;
-            i += 1;
-        };
-        
-        // Distribute proportionally
-        i = 0;
-        while (i < boosters_len) {
-            let booster = pool.boosters.borrow(i);
-            let booster_share = (total_boost_share * booster.boost_amount) / total_boost_amount;
-            
-            if (booster_share > 0) {
-                let booster_coins = coin::extract(&mut pool.pool_balance, booster_share);
-                coin::deposit(booster.address, booster_coins);
-                
-                // Emit event for booster distribution
-                event::emit(YieldDistributedEvent {
-                    pool_id: pool.pool_id,
-                    recipient: booster.address,
-                    amount: booster_share,
-                    cycle: pool.current_cycle + 1,
-                });
-            };
-            
-            i += 1;
-        };
-    }
-
     fun complete_pool(pool: &mut CommonFundPool) {
-        // Return locked principal to each member
+        let len = pool.positions.length();
         let i = 0;
-        let member_count = pool.members.length();
         
-        while (i < member_count) {
-            let member_info = pool.members.borrow(i);
-            let principal_coins = coin::extract(&mut pool.pool_balance, member_info.locked_amount);
-            coin::deposit(member_info.address, principal_coins);
+        while (i < len) {
+            let position = pool.positions.borrow(i);
+            let token_object = object::address_to_object<token::Token>(position.order_token_addr);
+            let owner_addr = object::owner(token_object);
+            
+            let principal = coin::extract(&mut pool.pool_balance, pool.contribution_per_member);
+            coin::deposit(owner_addr, principal);
+            
             i += 1;
         };
         
         pool.completed = true;
     }
 
-    fun find_member_index(pool: &CommonFundPool, member_addr: address): Option<u64> {
-        let i = 0;
-        let len = pool.members.length();
+    // === AUCTION SYSTEM ===
+
+    public entry fun place_bid(
+        bidder: &signer, 
+        pool_creator: address, 
+        bid_amount: u64
+    ) acquires CommonFundPool {
+        let pool = borrow_global_mut<CommonFundPool>(pool_creator);
+        let now = timestamp::now_seconds();
+        assert!(now < pool.auction_end_time, E_AUCTION_ENDED);
+        assert!(bid_amount > pool.auction_highest_bid, E_BID_TOO_LOW);
+
+        if (pool.auction_highest_bidder != @0x0) {
+            let refund = coin::extract(&mut pool.bid_vault, pool.auction_highest_bid);
+            coin::deposit(pool.auction_highest_bidder, refund);
+        };
+
+        let coins = coin::withdraw<AptosCoin>(bidder, bid_amount);
+        coin::merge(&mut pool.bid_vault, coins);
+
+        pool.auction_highest_bidder = signer::address_of(bidder);
+        pool.auction_highest_bid = bid_amount;
+
+        event::emit(BidEvent {
+            pool_id: pool.pool_id,
+            bidder: signer::address_of(bidder),
+            amount: bid_amount,
+            position: pool.current_position + 1
+        });
+    }
+
+    public entry fun finalize_auction(
+        caller: &signer, 
+        pool_creator: address
+    ) acquires CommonFundPool {
+        let caller_addr = signer::address_of(caller);
+        let pool = borrow_global_mut<CommonFundPool>(pool_creator);
+        assert!(caller_addr == pool.creator, E_NOT_AUTHORIZED);
         
-        while (i < len) {
-            let member = pool.members.borrow(i);
-            if (member.address == member_addr) {
-                return option::some(i)
+        let now = timestamp::now_seconds();
+        assert!(now >= pool.auction_end_time, E_AUCTION_NOT_ACTIVE);
+        assert!(pool.current_position < pool.target_size, E_POOL_ALREADY_ACTIVE);
+
+        let winner = pool.auction_highest_bidder;
+        let winning_amount = pool.auction_highest_bid;
+        assert!(winner != @0x0, E_NO_WINNER);
+
+        let pos_index = pool.current_position + 1;
+        let token_name = make_order_name(pos_index);
+
+        let token_constructor = token::create_named_token(
+            caller,
+            pool.collection_name,
+            string::utf8(b"ROSCA Order NFT"),
+            token_name,
+            option::none(),
+            string::utf8(b"https://retamifi.com/nft/metadata/")
+        );
+
+        let token_object = object::object_from_constructor_ref<token::Token>(&token_constructor);
+        let token_address = object::object_address(&token_object);
+
+        object::transfer(caller, token_object, winner);
+
+        let position = Position {
+            index: pos_index,
+            order_token_addr: token_address,
+            funded: false,
+            has_received_yield: false
+        };
+        pool.positions.push_back(position);
+
+        if (winning_amount > 0) {
+            let premium = coin::extract(&mut pool.bid_vault, winning_amount);
+            coin::merge(&mut pool.pool_balance, premium);
+        };
+
+        event::emit(OrderMintedEvent {
+            pool_id: pool.pool_id,
+            position: pos_index,
+            winner,
+            amount: winning_amount
+        });
+
+        pool.current_position += 1;
+        if (pool.current_position < pool.target_size) {
+            pool.auction_end_time = now + pool.auction_duration;
+            pool.auction_highest_bidder = @0x0;
+            pool.auction_highest_bid = 0;
+        } else {
+            pool.auction_end_time = 0;
+        };
+    }
+
+    // === FUNDING SYSTEM ===
+
+    public entry fun lock_funds(
+        owner: &signer, 
+        pool_creator: address
+    ) acquires CommonFundPool {
+        let owner_addr = signer::address_of(owner);
+        let pool = borrow_global_mut<CommonFundPool>(pool_creator);
+        assert!(!pool.completed, E_POOL_NOT_READY);
+
+        let len = pool.positions.length();
+        let i = 0;
+        let found = false;
+        
+        while (i < len && !found) {
+            let position_ref = pool.positions.borrow_mut(i);
+            if (!position_ref.funded) {
+                let token_addr = position_ref.order_token_addr;
+                
+                let token_object = object::address_to_object<token::Token>(token_addr);
+                if (object::is_owner(token_object, owner_addr)) {
+                    let coins = coin::withdraw<AptosCoin>(owner, pool.contribution_per_member);
+                    coin::merge(&mut pool.pool_balance, coins);
+                    position_ref.funded = true;
+                    found = true;
+                };
             };
             i += 1;
         };
         
-        option::none<u64>()
+        assert!(found, E_NOT_AUTHORIZED);
+
+        if (all_positions_funded(&pool.positions)) {
+            pool.is_active = true;
+            pool.last_distribution_time = timestamp::now_seconds();
+        };
+    }
+
+    // === BOOST SYSTEM ===
+
+    public entry fun boost(
+        booster: &signer, 
+        pool_creator: address, 
+        boost_amount: u64
+    ) acquires CommonFundPool {
+        let booster_addr = signer::address_of(booster);
+        let pool = borrow_global_mut<CommonFundPool>(pool_creator);
+        assert!(pool.is_active && !pool.completed, E_POOL_NOT_READY);
+
+        let main_pos_index = (pool.current_cycle as u64);
+        if (main_pos_index < pool.positions.length()) {
+            let main_position = pool.positions.borrow(main_pos_index);
+            let token_object = object::address_to_object<token::Token>(main_position.order_token_addr);
+            assert!(!object::is_owner(token_object, booster_addr), E_NOT_AUTHORIZED);
+        };
+
+        let coins = coin::withdraw<AptosCoin>(booster, boost_amount);
+        coin::merge(&mut pool.pool_balance, coins);
+
+        let booster_info = BoosterInfo { 
+            address: booster_addr, 
+            boost_amount 
+        };
+        pool.boosters.push_back(booster_info);
+
+        event::emit(BoostEvent {
+            pool_id: pool.pool_id,
+            booster: booster_addr,
+            amount: boost_amount,
+            cycle: pool.current_cycle
+        });
+    }
+
+    fun distribute_boost_share(pool: &mut CommonFundPool, total_boost_share: u64) {
+        if (total_boost_share == 0 || pool.boosters.is_empty()) { 
+            return 
+        };
+        
+        let len = pool.boosters.length();
+        let i = 0;
+        let total_boost_amount = 0;
+        
+        while (i < len) {
+            let booster = pool.boosters.borrow(i);
+            total_boost_amount += booster.boost_amount;
+            i += 1;
+        };
+        
+        if (total_boost_amount == 0) { 
+            return 
+        };
+
+        let j = 0;
+        while (j < len) {
+            let booster = pool.boosters.borrow(j);
+            let share = (total_boost_share * booster.boost_amount) / total_boost_amount;
+            
+            if (share > 0) {
+                let coins = coin::extract(&mut pool.pool_balance, share);
+                coin::deposit(booster.address, coins);
+                
+                event::emit(YieldDistributedEvent {
+                    pool_id: pool.pool_id,
+                    recipient: booster.address,
+                    amount: share,
+                    cycle: pool.current_cycle
+                });
+            };
+            
+            j += 1;
+        };
+    }
+
+    // === YIELD DISTRIBUTION ===
+
+    public entry fun claim_yield(
+        _caller: &signer, 
+        pool_creator: address, 
+        total_yield: u64
+    ) acquires CommonFundPool {
+        let pool = borrow_global_mut<CommonFundPool>(pool_creator);
+        assert!(pool.is_active && !pool.completed, E_POOL_NOT_READY);
+        
+        let now = timestamp::now_seconds();
+        assert!(now >= pool.last_distribution_time + pool.cycle_duration, E_POOL_NOT_READY);
+
+        let cycle_index = (pool.current_cycle as u64);
+        assert!(cycle_index < pool.positions.length(), E_INVALID_POSITION);
+        
+        let main_share = if (pool.boosters.is_empty()) {
+            total_yield
+        } else {
+            let total_boost_share = (total_yield * pool.boost_percentage) / PRECISION;
+            distribute_boost_share(pool, total_boost_share);
+            total_yield - total_boost_share
+        };
+
+        let position_ref = pool.positions.borrow_mut(cycle_index);
+        let token_object = object::address_to_object<token::Token>(position_ref.order_token_addr);
+        let owner_addr = object::owner(token_object);
+
+        if (main_share > 0) {
+            let coins = coin::extract(&mut pool.pool_balance, main_share);
+            coin::deposit(owner_addr, coins);
+            
+            event::emit(YieldDistributedEvent {
+                pool_id: pool.pool_id,
+                recipient: owner_addr,
+                amount: main_share,
+                cycle: pool.current_cycle + 1
+            });
+        };
+
+        position_ref.has_received_yield = true;
+        pool.current_cycle += 1;
+        pool.last_distribution_time = now;
+        pool.boosters = vector::empty<BoosterInfo>();
+
+        if ((pool.current_cycle as u64) >= (pool.target_size as u64)) {
+            complete_pool(pool);
+        };
     }
 }
