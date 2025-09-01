@@ -1,10 +1,12 @@
 [package]
-name = "retamifi"
+name = "disentry"
 version = "1.0.0"
 authors = []
 
 [addresses]
-retamifi = "0x281"
+disentry = "0x281"
+deployer = "0x123"
+dex_contract = "0x456"
 
 [dev-addresses]
 
@@ -17,5 +19,12 @@ subdir = "aptos-framework"
 git = "https://github.com/aptos-labs/aptos-framework.git"
 rev = "mainnet"
 subdir = "aptos-token-objects"
+
+# [dependencies]
+# dex-interface = { git = "https://github.com/Hyperfluid/hyperfluid-interface" }
+
+[dependencies.dex]
+git = "https://github.com/Hyperfluid/hyperfluid-interface"
+rev = "main"
 
 [dev-dependencies]

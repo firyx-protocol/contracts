@@ -1,0 +1,37 @@
+module disentry::math {
+    use aptos_framework::math64;
+
+    friend disentry::core;
+
+    /// ===== ERROR CODES =====
+    const E_DIVISION_BY_ZERO: u64 = 1;
+    const E_OVERFLOW: u64 = 2;
+
+    // ===== DECIMAL UTILS =====
+
+    /// Convert raw integer to decimal-adjusted value
+    /// 
+    /// Arguments:
+    /// * `amount` - The raw integer amount to be converted.
+    /// * `decimals` - The number of decimal places to adjust to.
+    ///
+    /// Returns:
+    /// * The decimal-adjusted value as u64.
+    public(friend) fun to_decimals(amount: u64, decimals: u64): u64 {
+        let factor = math64::pow(10, decimals);
+        amount * factor
+    }
+
+    /// Convert decimal-adjusted value back to raw integer
+    /// 
+    /// Arguments:
+    /// * `amount` - The decimal-adjusted amount to be converted back.
+    /// * `decimals` - The number of decimal places that were used for adjustment.
+    /// 
+    /// Returns:
+    /// * The raw integer amount as u64.
+    public(friend) fun from_decimals(amount: u64, decimals: u64): u64 {
+        let factor = math64::pow(10, decimals);
+        amount / factor
+    }
+}
