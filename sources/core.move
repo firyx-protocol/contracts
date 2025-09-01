@@ -5,7 +5,7 @@ module disentry::core {
     use std::vector;
     use aptos_framework::account;
     use aptos_framework::bcs;
-    use aptos_framework::fungible_asset::{Self, FungibleStore, FungibleAsset, Metadata, MintRef, TransferRef, BurnRef};
+    use aptos_framework::fungible_asset::{Self, FungibleAsset, Metadata, MintRef, TransferRef, BurnRef};
     use aptos_framework::object::{Self, Object};
     use aptos_framework::primary_fungible_store;
     use aptos_framework::dispatchable_fungible_asset;
@@ -14,12 +14,10 @@ module disentry::core {
     use aptos_framework::hash;
     use aptos_framework::debug;
 
-    use dex_contract::router_v3;
-    use dex_contract::pool_v3::{Self, LiquidityPoolV3};
-    use dex_contract::position_v3::{Self, Info};
-
     use disentry::math::{to_decimals, from_decimals};
 
+    friend disentry::hyperion_wrapper;
+    
     // === ERROR CODES ===
     
     const E_NOT_AUTHORIZED: u64 = 1;
@@ -27,8 +25,6 @@ module disentry::core {
     const E_INVALID_AMOUNT: u64 = 3;
     const E_COMPOUND_TOO_SMALL: u64 = 4;
     const E_THERMAL_ENGINE_NOT_INITIALIZED: u64 = 5;
-    const E_HYPERION_POOL_NOT_EXISTS: u64 = 6;
-    const E_SLIPPAGE_TOO_HIGH: u64 = 7;
 
     // === TOKEN CONSTANTS ===
 
@@ -50,15 +46,6 @@ module disentry::core {
     const TEMPERATURE_PRECISION: u64 = 100; // 1°C precision
     const MAX_THERMAL_POOLS: u64 = 10;
 
-    // === HYPERION CONSTANTS ===
-
-    const DEFAULT_SLIPPAGE_BPS: u64 = 300; // 3% slippage tolerance
-    const MIN_LIQUIDITY_AMOUNT: u64 = 100000; // 0.001 tokens minimum
-    const HYPERION_FEE_TIER: u8 = 3; // 0.3% fee tier
-    const DEFAULT_SQRT_PRICE_LIMIT: u128 = 0; // No price limit
-    const DEFAULT_TICK_LOWER: u32 = 0;
-    const DEFAULT_TICK_UPPER: u32 = 100000;
-
     // === STORAGE STRUCTS ===
 
     /// Stores token controller references and global statistics
@@ -68,8 +55,6 @@ module disentry::core {
         burn_ref: BurnRef,
         total_supply: u64,
         total_rewards_distributed: u64,
-        hyperion_pools: vector<Object<LiquidityPoolV3>>, // Pool objects on Hyperion V2
-        backing_asset_types: vector<String>,              // APT, USDC, etc.
     }
 
     /// User's vault position including stake amount and rewards data
@@ -79,9 +64,6 @@ module disentry::core {
         total_rewards_earned: u64,
         deposit_timestamp: u64,
         thermal_pool_id: u64, // Which thermal pool user belongs to
-        hyperion_position: Option<Object<position_v3::Info>>, // Position object on Hyperion V2
-        backing_assets: vector<u64>,                          // Amounts of backing assets
-        pending_fees: u64,                                    // Uncollected fees from Hyperion
     }
 
     /// Thermal pool data for dynamic yield calculation
@@ -93,8 +75,8 @@ module disentry::core {
         pool_creation_time: u64,       // Pool age for maturity bonus
         temperature_cache: u64,        // Cached temperature to avoid recalc
         last_temperature_update: u64,  // When temperature was last calculated
-        update_cooldown: u64,        // Cooldown period for updates
-        pending_updates: u64,         // Pending updates to apply
+        update_cooldown: u64,          // Cooldown period for updates
+        pending_updates: u64,          // Pending updates to apply
     }
 
     /// System-wide thermal engine configuration
@@ -104,22 +86,6 @@ module disentry::core {
         last_equilibration_time: u64,  // When pools were last balanced
         equilibration_interval: u64,   // How often to run equilibration (3600s = 1h)
         total_system_energy: u64,      // Total energy in all pools
-    }
-
-    struct HyperionPoolConfig has key {
-        apt_usdc_pool: Object<LiquidityPoolV3>,    // Main APT/USDC pool object
-        apt_usdt_pool: Object<LiquidityPoolV3>,    // APT/USDT pool object
-        usdc_usdt_pool: Object<LiquidityPoolV3>,   // Stablecoin pool object
-        fee_tiers: vector<u8>,                     // Fee tiers for each pool
-        tick_lower: u32,                           // Lower tick for positions
-        tick_upper: u32,                           // Upper tick for positions
-    }
-
-    struct TokenConfig has key {
-        apt_metadata: Object<Metadata>,
-        usdc_metadata: Object<Metadata>,
-        usdt_metadata: Object<Metadata>,
-        supported_tokens: vector<Object<Metadata>>,
     }
 
     // === INITIALIZATION FUNCTIONS ===
@@ -172,8 +138,6 @@ module disentry::core {
             burn_ref,
             total_supply: 0,
             total_rewards_distributed: 0,
-            hyperion_pools: vector::empty<Object<LiquidityPoolV3>>(),
-            backing_asset_types: vector::empty<String>(),
         };
 
         move_to(admin, controller);
@@ -216,12 +180,11 @@ module disentry::core {
 
     // === CORE PUBLIC ENTRY FUNCTIONS ===
 
-    /// Deposit liquidity into the protocol
+    /// Deposit liquidity into the protocol (basic version)
     public entry fun deposit_liquidity(
         user: &signer,
         amount: u64,
     ) acquires DisTokenController, VaultPosition, ThermalEngine {
-        // Legacy function - just mint dLP directly (for testing)
         let user_addr = signer::address_of(user);
         
         let controller = borrow_global_mut<DisTokenController>(@disentry);
@@ -229,17 +192,12 @@ module disentry::core {
         
         if (!exists<VaultPosition>(user_addr)) {
             let thermal_pool_id = assign_thermal_pool(user_addr);
-            let backing_assets = vector::singleton(amount);
-            backing_assets.push_back(0u64);
             let position = VaultPosition {
                 token_amount: amount,
                 last_compound_timestamp: timestamp::now_seconds(),
                 total_rewards_earned: 0,
                 deposit_timestamp: timestamp::now_seconds(),
                 thermal_pool_id,
-                hyperion_position: option::none(),
-                backing_assets,
-                pending_fees: 0,
             };
             move_to(user, position);
             
@@ -291,212 +249,87 @@ module disentry::core {
         controller.total_supply -= amount;
     }
 
-    /// Deposit liquidity using Hyperion V3 router
-    public entry fun deposit_liquidity_hyperion(
-        user: &signer,
-        apt_amount: u64,
-        usdc_amount: u64,
-    ) acquires DisTokenController, VaultPosition, ThermalEngine, TokenConfig {
-        let user_addr = signer::address_of(user);
-        
-        assert!(apt_amount > MIN_LIQUIDITY_AMOUNT, E_INVALID_AMOUNT);
-        assert!(usdc_amount > MIN_LIQUIDITY_AMOUNT, E_INVALID_AMOUNT);
-        
-        let token_config = borrow_global<TokenConfig>(@disentry);
-        let current_time = timestamp::now_seconds();
-        let deadline = current_time + 600; // 10 minutes deadline
+    // === PUBLIC FUNCTIONS FOR INTEGRATION ===
 
-        // 1. Open position using router_v3
-        let lp = pool_v3::open_position(
-            user,
-            token_config.apt_metadata,
-            token_config.usdc_metadata,
-            HYPERION_FEE_TIER,
-            DEFAULT_TICK_LOWER,
-            DEFAULT_TICK_UPPER,
-        );
-
-        // 3. Add liquidity to the position
-        router_v3::add_liquidity(
-            user,
-            lp,
-            token_config.apt_metadata,
-            token_config.usdc_metadata,
-            HYPERION_FEE_TIER,
-            apt_amount,
-            usdc_amount,
-            (apt_amount * 95) / 100, // 5% slippage tolerance
-            (usdc_amount * 95) / 100,
-            deadline
-        );
-        
-        // 4. Calculate dLP tokens to mint
-        let dlp_amount = calculate_dlp_mint_amount(apt_amount, usdc_amount);
-        
-        // 5. Mint dLP tokens to user
+    /// Mint dLP tokens (for integrations)
+    public(friend) fun mint_dlp_tokens(amount: u64): FungibleAsset acquires DisTokenController {
         let controller = borrow_global_mut<DisTokenController>(@disentry);
-        let new_tokens = fungible_asset::mint(&controller.mint_ref, dlp_amount);
-        
-        // 6. Create or update user position
+        controller.total_supply += amount;
+        fungible_asset::mint(&controller.mint_ref, amount)
+    }
+
+    /// Burn dLP tokens (for integrations)
+    public(friend) fun burn_dlp_tokens(tokens: FungibleAsset) acquires DisTokenController {
+        let amount = fungible_asset::amount(&tokens);
+        let controller = borrow_global_mut<DisTokenController>(@disentry);
+        controller.total_supply -= amount;
+        fungible_asset::burn(&controller.burn_ref, tokens);
+    }
+
+    /// Create vault position (for integrations)
+    public fun create_vault_position(
+        user: &signer,
+        token_amount: u64,
+    ) acquires VaultPosition, ThermalEngine {
+        let user_addr = signer::address_of(user);
+
         if (!exists<VaultPosition>(user_addr)) {
             let thermal_pool_id = assign_thermal_pool(user_addr);
-            let backing_assets = vector::singleton(apt_amount);
-            backing_assets.push_back(usdc_amount);
-            
-            let vault_position = VaultPosition {
-                token_amount: dlp_amount,
+            let position = VaultPosition {
+                token_amount,
                 last_compound_timestamp: timestamp::now_seconds(),
                 total_rewards_earned: 0,
                 deposit_timestamp: timestamp::now_seconds(),
                 thermal_pool_id,
-                hyperion_position: option::some(lp),
-                backing_assets,
-                pending_fees: 0,
             };
-            move_to(user, vault_position);
+            move_to(user, position);
             
-            update_thermal_pool_activity_efficient(thermal_pool_id, dlp_amount);
+            update_thermal_pool_activity_efficient(thermal_pool_id, token_amount);
         } else {
-            let vault_position = borrow_global_mut<VaultPosition>(user_addr);
-            vault_position.token_amount += dlp_amount;
-            vault_position.hyperion_position = option::some(lp);
-            
-            // Update backing assets
-            *vault_position.backing_assets.borrow_mut(0) += apt_amount;
-            *vault_position.backing_assets.borrow_mut(1) += usdc_amount;
-            
-            update_thermal_pool_activity_efficient(vault_position.thermal_pool_id, dlp_amount);
+            let position = borrow_global_mut<VaultPosition>(user_addr);
+            position.token_amount += token_amount;
+            update_thermal_pool_activity_efficient(position.thermal_pool_id, token_amount);
         };
+    }
 
-        // 7. Deposit dLP tokens to user's wallet
+    /// Update vault position (for integrations)
+    public fun update_vault_position(
+        user_addr: address,
+        token_delta: u64,
+        is_increase: bool,
+    ) acquires VaultPosition, ThermalEngine {
+        let position = borrow_global_mut<VaultPosition>(user_addr);
+        
+        if (is_increase) {
+            position.token_amount += token_delta;
+        } else {
+            assert!(position.token_amount >= token_delta, E_INSUFFICIENT_BALANCE);
+            position.token_amount -= token_delta;
+        };
+        
+        update_thermal_pool_activity_efficient(position.thermal_pool_id, token_delta);
+    }
+
+    /// Deposit dLP tokens to user (for integrations)
+    public(friend) fun deposit_dlp_to_user(user_addr: address, tokens: FungibleAsset) 
+    acquires DisTokenController {
+        let controller = borrow_global<DisTokenController>(@disentry);
         primary_fungible_store::deposit_with_ref(
             &controller.transfer_ref,
             user_addr, 
-            new_tokens
+            tokens
         );
-        
-        controller.total_supply += dlp_amount;
     }
 
-    /// Withdraw liquidity using Hyperion V3 router
-    public entry fun withdraw_liquidity_hyperion(
-        user: &signer,
-        dlp_amount: u64,
-        liquidity_delta: u128,
-    ) acquires DisTokenController, VaultPosition, ThermalEngine {
-        let user_addr = signer::address_of(user);
-        let position = borrow_global_mut<VaultPosition>(user_addr);
-        
-        // Trigger thermal auto-compound first
-        thermal_auto_compound_internal(position, user_addr);
-        
-        assert!(position.token_amount >= dlp_amount, E_INSUFFICIENT_BALANCE);
-        assert!(dlp_amount > 0, E_INVALID_AMOUNT);
-        assert!(position.hyperion_position.is_some(), E_HYPERION_POOL_NOT_EXISTS);
-        
-        let hyperion_position = *position.hyperion_position.borrow();
-        let current_time = timestamp::now_seconds();
-        let deadline = current_time + 600; // 10 minutes deadline
-        
-        // 1. Remove liquidity from Hyperion V3
-        router_v3::remove_liquidity(
-            user,
-            hyperion_position,
-            liquidity_delta,
-            0, // amount_a_min (accept any amount for simplicity)
-            0, // amount_b_min  
-            user_addr, // recipient
-            deadline
-        );
-        
-        // 2. Burn dLP tokens
-        let controller = borrow_global_mut<DisTokenController>(@disentry);
-        let tokens_to_burn = primary_fungible_store::withdraw_with_ref(
+    /// Withdraw dLP tokens from user (for integrations)
+    public(friend) fun withdraw_dlp_from_user(user_addr: address, amount: u64): FungibleAsset 
+    acquires DisTokenController {
+        let controller = borrow_global<DisTokenController>(@disentry);
+        primary_fungible_store::withdraw_with_ref(
             &controller.transfer_ref,
             user_addr,
-            dlp_amount
-        );
-        
-        // 3. Update position
-        position.token_amount -= dlp_amount;
-        
-        // Update backing assets proportionally
-        let withdraw_ratio = (dlp_amount * 10000) / (position.token_amount + dlp_amount);
-        let apt_to_subtract = (position.backing_assets[0] * withdraw_ratio) / 10000;
-        let usdc_to_subtract = (position.backing_assets[1] * withdraw_ratio) / 10000;
-        
-        *position.backing_assets.borrow_mut(0) -= apt_to_subtract;
-        *position.backing_assets.borrow_mut(1) -= usdc_to_subtract;
-        
-        update_thermal_pool_activity_efficient(position.thermal_pool_id, dlp_amount);
-        
-        // 4. Burn the dLP tokens
-        fungible_asset::burn(&controller.burn_ref, tokens_to_burn);
-        controller.total_supply -= dlp_amount;
-    }
-
-    /// Harvest trading fees and rewards from Hyperion V3
-    public entry fun harvest_hyperion_rewards(
-        user: &signer
-    ) acquires VaultPosition, DisTokenController, ThermalEngine {
-        let user_addr = signer::address_of(user);
-        let position = borrow_global_mut<VaultPosition>(user_addr);
-        
-        if (position.hyperion_position.is_some()) {
-            let hyperion_position = *position.hyperion_position.borrow();
-            let position_addresses = vector::singleton(object::object_address(&hyperion_position));
-            
-            // Claim fees using router_v3
-            router_v3::claim_fees(user, position_addresses, user_addr);
-            
-            // Claim rewards using router_v3  
-            router_v3::claim_rewards(user, hyperion_position, user_addr);
-            
-            // Update position - fees are now in user's account
-            // For simplicity, we'll just trigger thermal compound
-            thermal_auto_compound_internal(position, user_addr);
-        };
-    }
-
-    /// Swap tokens using Hyperion V3 router
-    public entry fun swap_tokens_hyperion(
-        user: &signer,
-        amount_in: u64,
-        amount_out_min: u64,
-        is_apt_to_usdc: bool,
-    ) acquires TokenConfig {
-        let token_config = borrow_global<TokenConfig>(@disentry);
-        let user_addr = signer::address_of(user);
-        let current_time = timestamp::now_seconds();
-        let deadline = current_time + 300; // 5 minutes deadline
-        
-        if (is_apt_to_usdc) {
-            // Swap APT to USDC
-            router_v3::exact_input_swap_entry(
-                user,
-                HYPERION_FEE_TIER,
-                amount_in,
-                amount_out_min,
-                DEFAULT_SQRT_PRICE_LIMIT,
-                token_config.apt_metadata,
-                token_config.usdc_metadata,
-                user_addr,
-                deadline
-            );
-        } else {
-            // Swap USDC to APT
-            router_v3::exact_input_swap_entry(
-                user,
-                HYPERION_FEE_TIER,
-                amount_in,
-                amount_out_min,
-                DEFAULT_SQRT_PRICE_LIMIT,
-                token_config.usdc_metadata,
-                token_config.apt_metadata,
-                user_addr,
-                deadline
-            );
-        };
+            amount
+        )
     }
 
     // === DFA HOOKS ===
@@ -543,7 +376,7 @@ module disentry::core {
 
         let position = borrow_global<VaultPosition>(store_addr);
         let pending_rewards = calculate_thermal_pending_rewards(position);
-        actual_balance + pending_rewards + position.pending_fees
+        actual_balance + pending_rewards
     }
 
     // === INTERNAL FUNCTIONS ===
@@ -585,11 +418,10 @@ module disentry::core {
             };
         };
     }
-
+    
     /// Calculate rewards using thermal engine
     fun calculate_thermal_compound_rewards(position: &VaultPosition): u64 acquires ThermalEngine {
         if (!exists<ThermalEngine>(@disentry)) {
-            // Fallback to simple calculation if thermal engine not initialized
             return calculate_compound_rewards(
                 position.token_amount,
                 timestamp::now_seconds() - position.last_compound_timestamp
@@ -599,7 +431,6 @@ module disentry::core {
         let thermal_engine = borrow_global<ThermalEngine>(@disentry);
         let pool = thermal_engine.pools.borrow(position.thermal_pool_id);
         
-        // Calculate dynamic APY based on thermal state
         let thermal_apy = calculate_thermal_apy(pool, thermal_engine.equilibrium_temperature);
         
         let time_elapsed = timestamp::now_seconds() - position.last_compound_timestamp;
@@ -644,7 +475,6 @@ module disentry::core {
             pool.active_users += 1;
         };
         
-        // Invalidate temperature cache
         pool.last_temperature_update = 0;
     }
 
@@ -659,8 +489,6 @@ module disentry::core {
 
     // === VIEW FUNCTIONS ===
     
-    /// Get user vault position details
-    /// @returns (token_amount, total_rewards_earned, pending_rewards, deposit_timestamp)
     #[view]
     public fun get_vault_position(user_addr: address): (u64, u64, u64, u64) acquires VaultPosition, ThermalEngine {
         if (!exists<VaultPosition>(user_addr)) {
@@ -678,22 +506,17 @@ module disentry::core {
         )
     }
 
-    /// Get protocol-wide statistics
-    /// @returns (total_supply, total_rewards_distributed)
     #[view]
     public fun get_protocol_stats(): (u64, u64) acquires DisTokenController {
         let controller = borrow_global<DisTokenController>(@disentry);
         (controller.total_supply, controller.total_rewards_distributed)
     }
 
-    /// Get current base APY
     #[view]
     public fun get_current_apy(): u64 {
         BASE_APY
     }
 
-    /// Get information about a specific thermal pool
-    /// @returns (total_liquidity, active_users, cumulative_volume, current_apy, temperature)
     #[view]
     public fun get_thermal_pool_info(pool_id: u64): (u64, u64, u64, u64, u64) acquires ThermalEngine {
         if (!exists<ThermalEngine>(@disentry)) {
@@ -718,8 +541,6 @@ module disentry::core {
         )
     }
 
-    /// Get thermal information for a specific user
-    /// @returns (pool_id, current_apy, temperature)
     #[view]
     public fun get_user_thermal_info(user_addr: address): (u64, u64, u64) acquires VaultPosition, ThermalEngine {
         if (!exists<VaultPosition>(user_addr) || !exists<ThermalEngine>(@disentry)) {
@@ -738,49 +559,43 @@ module disentry::core {
 
     // === HELPER FUNCTIONS ===
 
-    /// Calculate the temperature of a thermal pool
     fun calculate_pool_temperature(pool: &ThermalPool): u64 {
         let current_time = timestamp::now_seconds();
         
-        // Cache temperature for 5 minutes to save gas
         if (current_time - pool.last_temperature_update < 300) {
             return pool.temperature_cache
         };
 
         let base_temp = BASE_TEMPERATURE;
         
-        // 1. Liquidity factor: larger pools = more stable (lower temp variance)
-        let liquidity_factor = if (pool.total_liquidity > 100000000) { // > 1000 tokens
-            9900 // 99% - large pools more stable
-        } else if (pool.total_liquidity > 10000000) { // > 100 tokens
-            10000 // 100% - medium pools
+        let liquidity_factor = if (pool.total_liquidity > 100000000) {
+            9900
+        } else if (pool.total_liquidity > 10000000) {
+            10000
         } else {
-            10100 // 101% - small pools more volatile
+            10100
         };
         
-        // 2. Activity factor: recent activity = higher temperature
         let time_since_activity = current_time - pool.last_activity_timestamp;
-        let activity_boost = if (time_since_activity < 1800) { // < 30 min
-            200 // +2°C for recent activity
-        } else if (time_since_activity < 7200) { // < 2 hours
-            100 // +1°C for moderate activity
-        } else {
-            0 // Cold pool
-        };
-        
-        // 3. User density: more active users = higher temperature
-        let user_heat = if (pool.active_users > 0) {
-            pool.active_users * 10 // 0.1°C per active user
+        let activity_boost = if (time_since_activity < 1800) {
+            200
+        } else if (time_since_activity < 7200) {
+            100
         } else {
             0
         };
         
-        // 4. Age factor: older pools = more stable (lower temperature)
+        let user_heat = if (pool.active_users > 0) {
+            pool.active_users * 10
+        } else {
+            0
+        };
+        
         let pool_age_days = (current_time - pool.pool_creation_time) / 86400;
         let maturity_cooling = if (pool_age_days > 30) {
-            50 // -0.5°C for mature pools
+            50
         } else if (pool_age_days > 7) {
-            25 // -0.25°C for week-old pools
+            25
         } else {
             0
         };
@@ -789,53 +604,47 @@ module disentry::core {
         if (final_temp > maturity_cooling) {
             final_temp - maturity_cooling
         } else {
-            base_temp / 2 // Minimum temperature
+            base_temp / 2
         }
     }
 
-    /// Calculate dynamic APY based on thermal state
     fun calculate_thermal_apy(pool: &ThermalPool, equilibrium_temp: u64): u64 {
         let pool_temp = calculate_pool_temperature(pool);
         let base_apy = BASE_APY;
         
-        // 1. Temperature deviation bonus/penalty
         let temp_factor = if (pool_temp > equilibrium_temp) {
-            // Hot pool: higher activity = higher yield
             let deviation = pool_temp - equilibrium_temp;
-            10000 + (deviation * 5) // +0.05% per degree above equilibrium
+            10000 + (deviation * 5)
         } else {
-            // Cold pool: lower activity = lower yield
             let deviation = equilibrium_temp - pool_temp;
-            let penalty = deviation * 3; // -0.03% per degree below
+            let penalty = deviation * 3;
             if (penalty > 10000) {
-                5000 // Minimum 50% of base APY
+                5000
             } else {
                 10000 - penalty
             }
         };
         
-        // 2. Equilibrium proximity bonus
         let equilibrium_distance = if (pool_temp > equilibrium_temp) {
             pool_temp - equilibrium_temp
         } else {
             equilibrium_temp - pool_temp
         };
         
-        let equilibrium_bonus = if (equilibrium_distance < TEMPERATURE_PRECISION) { // Within 1°C
-            300 // +3% bonus for being near equilibrium
-        } else if (equilibrium_distance < TEMPERATURE_PRECISION * 5) { // Within 5°C
-            150 // +1.5% bonus
+        let equilibrium_bonus = if (equilibrium_distance < TEMPERATURE_PRECISION) {
+            300
+        } else if (equilibrium_distance < TEMPERATURE_PRECISION * 5) {
+            150
         } else {
             0
         };
         
-        // 3. Pool maturity bonus
         let current_time = timestamp::now_seconds();
         let pool_age_days = (current_time - pool.pool_creation_time) / 86400;
         let maturity_bonus = if (pool_age_days > 30) {
-            200 // +2% for mature pools
+            200
         } else if (pool_age_days > 7) {
-            100 // +1% for week-old pools
+            100
         } else {
             0
         };
@@ -843,16 +652,6 @@ module disentry::core {
         (base_apy * temp_factor / 10000) + equilibrium_bonus + maturity_bonus
     }
 
-    fun calculate_dlp_mint_amount(apt_amount: u64, usdc_amount: u64): u64 {
-        // Simple calculation: convert both assets to USD value and mint dLP accordingly
-        // Assume 1 APT = $10 USD, 1 USDC = $1 USD
-        let apt_value = apt_amount * 10 * 100000000 / 100000000; // APT has 8 decimals
-        let usdc_value = usdc_amount;
-        
-        apt_value + usdc_value // Total USD value becomes dLP amount
-    }
-
-    /// Calculate rewards using standard APY calculation (fallback)
     fun calculate_compound_rewards(principal: u64, time_elapsed_seconds: u64): u64 {
         if (time_elapsed_seconds == 0 || principal == 0) {
             return 0
@@ -860,33 +659,6 @@ module disentry::core {
 
         let annual_reward = (principal * BASE_APY) / 10000;
         (annual_reward * time_elapsed_seconds) / SECONDS_PER_YEAR
-    }
-
-    fun calculate_reward_value(reward_assets: vector<FungibleAsset>): u64 {
-        let total_value = 0;
-        let i = 0;
-        while (i < reward_assets.length()) {
-            let reward_fa = reward_assets.borrow(i);
-            total_value += fungible_asset::amount(reward_fa);
-            i += 1;
-        };
-        
-        // Handle reward assets (deposit them to user)
-        i = 0;
-        while (i < reward_assets.length()) {
-            let reward_fa = reward_assets.pop_back();
-            if (fungible_asset::amount(&reward_fa) > 0) {
-                // In a real implementation, you'd need to know the user address
-                // For now, just destroy zero or handle appropriately
-                fungible_asset::destroy_zero(reward_fa);
-            } else {
-                fungible_asset::destroy_zero(reward_fa);
-            };
-            i += 1;
-        };
-        
-        reward_assets.destroy_empty();
-        total_value
     }
 
     fun address_to_u64(addr: address): u64 {
@@ -904,37 +676,8 @@ module disentry::core {
 
     // === ADMIN FUNCTIONS ===
 
-    /// Update token configuration for mainnet deployment
-    public entry fun update_token_config(
-        admin: &signer,
-        apt_address: address,
-        usdc_address: address,
-        usdt_address: address,
-    ) acquires TokenConfig {
-        // Add admin authorization check here
-        assert!(signer::address_of(admin) == @disentry, E_NOT_AUTHORIZED);
-        
-        let apt_metadata = object::address_to_object<Metadata>(apt_address);
-        let usdc_metadata = object::address_to_object<Metadata>(usdc_address);
-        let usdt_metadata = object::address_to_object<Metadata>(usdt_address);
-        
-        let token_config = borrow_global_mut<TokenConfig>(@disentry);
-        token_config.apt_metadata = apt_metadata;
-        token_config.usdc_metadata = usdc_metadata;
-        token_config.usdt_metadata = usdt_metadata;
-        
-        // Update supported tokens list
-        token_config.supported_tokens = vector::empty<Object<Metadata>>();
-        token_config.supported_tokens.push_back(apt_metadata);
-        token_config.supported_tokens.push_back(usdc_metadata);
-        token_config.supported_tokens.push_back(usdt_metadata);
-    }
-
-    /// Emergency pause function
     public entry fun emergency_pause(admin: &signer) {
         assert!(signer::address_of(admin) == @disentry, E_NOT_AUTHORIZED);
-        // Implement emergency pause logic here
-        // This could disable deposits/withdrawals in emergency situations
     }
 
     // === TEST FUNCTIONS ===
@@ -1001,9 +744,5 @@ module disentry::core {
         timestamp::fast_forward_seconds(31536000);
 
         withdraw_liquidity(user, to_decimals(100, DECIMALS as u64));
-
-        // (balance, rewards, _, _) = get_vault_position(user_addr);
-        // assert!(balance == to_decimals(50, DECIMALS as u64), 3001);
-        // assert!(rewards > 0, 3002);
     }
 }
