@@ -2,7 +2,8 @@ module fered::math {
     use aptos_framework::math64;
 
     // friend fered::core;
-    // friend fered::loan_slot;
+    friend fered::loan_slot;
+    friend fered::loan_position;
 
     /// ===== ERROR CODES =====
     const E_DIVISION_BY_ZERO: u64 = 1;
@@ -11,6 +12,7 @@ module fered::math {
     /// ===== CONSTANTS =====
     const Q64: u128 = 1 << 64;
     const BPS: u64 = 10_000; // Basis points
+    const PRECISION: u128 = 1_000_000_000_000;
 
     // ===== DECIMAL UTILS =====
 
@@ -46,5 +48,9 @@ module fered::math {
 
     public(friend) fun bps(): u64 {
         BPS
+    }
+
+    public(friend) fun precision(): u128 {
+        PRECISION
     }
 }
