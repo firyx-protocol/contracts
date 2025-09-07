@@ -29,7 +29,7 @@ module fered::loan_slot {
 
     // === STRUCTS ===
     struct LoanSlot has key {
-        loan_slot_addr: address,
+        loan_pos_addr: address,
         principal: u64,
         colleteral: u64,
         debt_idx_at_borrow: u128,
@@ -54,16 +54,24 @@ module fered::loan_slot {
     }
 
     // === CORE FUNCTIONS ===
+    /// Create a new loan slot for a borrower
+    ///
+    /// Arguments:
+    /// * `borrower` - Signer
+    /// * `loan_pos_addr` - The address of the associated loan position.
+    /// * `principal` - The principal amount of the loan.
+    /// * `colleteral` - The collateral amount provided for the loan.
+    /// * `debt_idx_at_borrow` - The debt index at the time of borrowing.
     public(friend) fun create_loan_slot(
         borrower: &signer,
-        loan_slot_addr: address,
+        loan_pos_addr: address,
         principal: u64,
         colleteral: u64,
         debt_idx_at_borrow: u128
     ): Object<LoanSlot> {
         let ts = timestamp::now_seconds();
         let borrow_info = LoanSlot {
-            loan_slot_addr,
+            loan_pos_addr,
             principal,
             colleteral,
             debt_idx_at_borrow,
@@ -89,6 +97,13 @@ module fered::loan_slot {
         loan_slot_obj
     }
 
+    /// Withdraw collateral by repaying part or all of the loan
+    ///
+    /// Returns:
+    /// * `collateral_withdrawn` - The amount of collateral withdrawn.
+    /// * `interest_paid` - The interest portion paid.
+    /// * `loan_repaid` - Whether the loan is fully repaid.
+    /// * `new_debt_idx` - The updated debt index after repayment.
     public(friend) fun withdraw(
         borrower: &signer,
         ls_obj: Object<LoanSlot>,
@@ -121,6 +136,13 @@ module fered::loan_slot {
         (collateral_to_withdraw, interest_portion, loan_repaid, new_debt_idx)
     }
 
+    /// Repay part or all of the loan
+    ///
+    /// Returns:
+    /// * `principal_portion` - The portion of the amount that goes towards principal.
+    /// * `interest_portion` - The portion that goes towards interest.
+    /// * `loan_repaid` - Whether the loan is fully repaid.
+    /// * `new_debt_idx` - The updated debt index after repayment.
     public(friend) fun repay(
         borrower: &signer,
         ls_obj: Object<LoanSlot>,
@@ -178,8 +200,14 @@ module fered::loan_slot {
         (principal_portion, interest_portion, loan_repaid, new_debt_idx)
     }
 
+    /// Liquidate an undercollateralized loan slot
+    ///
+    /// Returns:
+    /// * `liquidated` - Whether the liquidation was successful.
+    /// * `liquidation_bonus` - The bonus amount awarded to the liquidator.
+    /// * `protocol_fee` - The fee amount taken by the protocol.
+    /// * `remaining_collateral` - The collateral remaining after liquidation.
     public(friend) fun liquidate(
-        _liquidator: &signer,
         ls_obj: Object<LoanSlot>,
         current_debt_idx: u128,
         liquidation_threshold: u64 // LTV threshold in basis points (e.g., 8500 = 85%)
@@ -313,7 +341,7 @@ module fered::loan_slot {
     }
 
     public(friend) fun loan_slot_address(loan_slot_obj: Object<LoanSlot>): address acquires LoanSlot {
-        borrow_loan_slot(loan_slot_obj).loan_slot_addr
+        borrow_loan_slot(loan_slot_obj).loan_pos_addr
     }
 
     // Global state view
@@ -432,19 +460,18 @@ module fered::loan_slot {
                 withdraw_amount
             );
 
-        let expected_principal_portion = 299u64; // 299.9985 casted to u64
         let expected_interest_portion = 1u64; // 300 - 299
         let expected_collateral_withdrawn = 598u64; // 2000 * 299 / 1000
         let expected_remaining_principal = 701u64; // 1000 - 299
 
-        debug::print(&collateral_withdrawn);
-        debug::print(&expected_collateral_withdrawn);
+        let principal_after = principal(loan_obj);
+
         assert!(collateral_withdrawn == expected_collateral_withdrawn, 1);
         assert!(interest_paid == expected_interest_portion, 2);
         assert!(!loan_repaid, 3);
         assert!(new_debt_idx > 0, 4);
+        assert!(principal_after == expected_remaining_principal, 5);
 
-        // Cập nhật withdrawn_amount và available_withdraw
         let withdrawn = withdrawn_amount(loan_obj);
         let available = available_withdraw(loan_obj);
         let principal = principal(loan_obj);
@@ -452,12 +479,11 @@ module fered::loan_slot {
         assert!(withdrawn >= collateral_withdrawn, 4);
         assert!(available <= principal, 5);
 
-        // Kiểm tra trạng thái loan
         let active = is_active(loan_obj);
         assert!(active == !loan_repaid, 6);
     }
-    #[test(fered = @fered, aptos_framework = @0x1, borrower
-= @0x123)]
+
+    #[test(fered = @fered, aptos_framework = @0x1, borrower = @0x123)]
     fun test_withdraw_full_repayment(
         fered: &signer, aptos_framework: &signer, borrower: &signer
     ) acquires LoanSlot {
@@ -501,24 +527,23 @@ module fered::loan_slot {
 
         let loan_obj = create_loan_slot(borrower, @0x456, 1000, 2000, 1000000000000);
 
-        repay(borrower, loan_obj, 1200000000000, 1500);
+        let current_debt_idx = 1000000005000u128;
+        let (_, _, _, new_debt_idx) = repay(borrower, loan_obj, current_debt_idx, 1500);
 
-        let (principal_portion, interest_portion, loan_repaid, debt_idx) =
-            repay(borrower, loan_obj, 1200000000000, 100);
+        let (principal_portion, interest_portion, loan_repaid, newest_debt_idx) =
+            repay(borrower, loan_obj, new_debt_idx, 100);
 
         assert!(principal_portion == 0, 1);
         assert!(interest_portion == 0, 2);
         assert!(!loan_repaid, 3);
+        assert!(newest_debt_idx == new_debt_idx, 4);
     }
 
-    #[test(
-        fered = @fered, aptos_framework = @0x1, borrower = @0x123, liquidator = @0x999
-    )]
+    #[test(fered = @fered, aptos_framework = @0x1, borrower = @0x123)]
     fun test_liquidation_success(
         fered: &signer,
         aptos_framework: &signer,
-        borrower: &signer,
-        liquidator: &signer
+        borrower: &signer
     ) acquires LoanSlot {
         init_for_test(fered, aptos_framework);
 
@@ -529,7 +554,6 @@ module fered::loan_slot {
 
         let (liquidated, bonus, protocol_fee, remaining) =
             liquidate(
-                liquidator,
                 loan_obj,
                 high_debt_idx,
                 liquidation_threshold
@@ -543,14 +567,11 @@ module fered::loan_slot {
         assert!(is_liquidated(loan_obj), 6);
     }
 
-    #[test(
-        fered = @fered, aptos_framework = @0x1, borrower = @0x123, liquidator = @0x999
-    )]
+    #[test(fered = @fered, aptos_framework = @0x1, borrower = @0x123)]
     fun test_liquidation_healthy_loan(
         fered: &signer,
         aptos_framework: &signer,
-        borrower: &signer,
-        liquidator: &signer
+        borrower: &signer
     ) acquires LoanSlot {
         init_for_test(fered, aptos_framework);
 
@@ -560,7 +581,6 @@ module fered::loan_slot {
 
         let (liquidated, bonus, protocol_fee, remaining) =
             liquidate(
-                liquidator,
                 loan_obj,
                 normal_debt_idx,
                 liquidation_threshold
@@ -592,9 +612,7 @@ module fered::loan_slot {
         assert!(ltv == 0, 2); // Very small LTV due to large collateral
     }
 
-    #[test(
-        fered = @fered, aptos_framework = @0x1, borrower = @0x123, liquidator = @0x999
-    )]
+    #[test(fered = @fered, aptos_framework = @0x1, borrower = @0x123)]
     fun test_loan_lifecycle(
         fered: &signer,
         aptos_framework: &signer,
@@ -616,15 +634,14 @@ module fered::loan_slot {
         let debt_idx_2 = 1300000000000u128;
 
         // Try liquidation (should fail - healthy)
-        let (liquidated1, _, _, _) = liquidate(liquidator, loan_obj, debt_idx_2, 8500);
+        let (liquidated1, _, _, _) = liquidate(loan_obj, debt_idx_2, 8500);
         assert!(!liquidated1, 3);
 
         // More time passes, debt grows significantly
         let debt_idx_3 = 2500000000000u128;
 
         // Liquidation should succeed now
-        let (liquidated2, bonus, fee, remaining) =
-            liquidate(liquidator, loan_obj, debt_idx_3, 8500);
+        let (liquidated2, bonus, fee, remaining) = liquidate(loan_obj, debt_idx_3, 8500);
         assert!(liquidated2, 4);
         assert!(bonus > 0, 5);
         assert!(fee > 0, 6);
