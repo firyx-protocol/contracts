@@ -3,6 +3,7 @@ module fered::math {
 
     // friend fered::core;
     friend fered::loan_slot;
+    friend fered::deposit_slot;
     friend fered::loan_position;
 
     /// ===== ERROR CODES =====

@@ -7,7 +7,6 @@ module fered::loan_slot {
     use aptos_framework::math64;
     use aptos_framework::math128;
     use aptos_framework::error;
-    use aptos_framework::debug;
     use fered::math::{bps};
 
     // friend fered::core;
@@ -33,7 +32,7 @@ module fered::loan_slot {
         principal: u64,
         colleteral: u64,
         debt_idx_at_borrow: u128,
-        ts: u64,
+        created_at_ts: u64,
         active: bool,
         liquidated: bool, /// Track if the loan has been liquidated
         yield_earned: u128, /// Yield earned from position on Hyperion
@@ -75,7 +74,7 @@ module fered::loan_slot {
             principal,
             colleteral,
             debt_idx_at_borrow,
-            ts,
+            created_at_ts: ts,
             active: true,
             liquidated: false,
             yield_earned: 0,
@@ -283,7 +282,7 @@ module fered::loan_slot {
     }
 
     public(friend) fun timestamp_created(loan_slot_obj: Object<LoanSlot>): u64 acquires LoanSlot {
-        borrow_loan_slot(loan_slot_obj).ts
+        borrow_loan_slot(loan_slot_obj).created_at_ts
     }
 
     public(friend) fun last_payment_timestamp(
@@ -419,8 +418,8 @@ module fered::loan_slot {
         assert!(debt_idx_at_borrow(loan_obj) == debt_idx, 3);
         assert!(is_active(loan_obj), 4);
         assert!(!is_liquidated(loan_obj), 5);
-        assert!(withdrawn_amount(loan_obj) == principal, 6);
-        assert!(available_withdraw(loan_obj) == 0, 7);
+        assert!(withdrawn_amount(loan_obj) == 0, 6);
+        assert!(available_withdraw(loan_obj) == principal, 7);
     }
 
     #[test(fered = @fered, aptos_framework = @0x1, borrower = @0x123)]
@@ -616,8 +615,7 @@ module fered::loan_slot {
     fun test_loan_lifecycle(
         fered: &signer,
         aptos_framework: &signer,
-        borrower: &signer,
-        liquidator: &signer
+        borrower: &signer
     ) acquires LoanSlot {
         init_for_test(fered, aptos_framework);
 

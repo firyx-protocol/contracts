@@ -1,368 +1,459 @@
-// module fered::deposit_slot {
-//     use std::signer;
-//     use aptos_framework::object::{Self, Object};
-//     use aptos_framework::timestamp;
-//     use aptos_framework::coin::{Self, Coin};
-//     use aptos_framework::event;
-//     use aptos_framework::math64;
-//     use fered::loan_position;
+module fered::deposit_slot {
+    use std::signer;
+    use aptos_framework::object::{Self, Object};
+    use aptos_framework::timestamp;
+    use aptos_framework::math128;
+    use aptos_framework::error;
+    use fered::math::{bps};
 
-//     // === CONSTANTS ===
-//     const PRECISION: u128 = 1000000;
-//     const BASIS_POINTS: u64 = 10000;
+    // friend fered::core;
 
-//     // === ERRORS (existing + new) ===
-//     const E_DEPOSIT_SLOT_NOT_FOUND: u64 = 4001;
-//     const E_UNAUTHORIZED: u64 = 4002;
-//     const E_INSUFFICIENT_BALANCE: u64 = 4003;
-//     const E_INVALID_AMOUNT: u64 = 4004;
-//     const E_POSITION_INACTIVE: u64 = 4005;
-//     const E_INSUFFICIENT_LIQUIDITY: u64 = 4006;
+    // === CONSTANTS ===
+    const PRECISION: u128 = 1_000_000_000_000;
 
-//     // === STRUCTS (base unchanged) ===
-//     struct DepositSlotInfo has key {
-//         loan_position_addr: address,
-//         lender: address,
-//         principal: u64,
-//         shares: u64,
-//         debt_idx_at_deposit: u128,
-//         created_at: u64,
-//         active: bool,
-//         total_yield_claimed: u64,
-//         last_yield_claim: u64
-//     }
+    // === ERRORS ===
+    /// Deposit slot not found
+    const E_DEPOSIT_SLOT_NOT_FOUND: u64 = 4001;
+    /// Unauthorized access
+    const E_UNAUTHORIZED: u64 = 4002;
+    /// Deposit slot is not active
+    const E_NOT_ACTIVE: u64 = 4003;
+    /// Invalid amount
+    const E_INVALID_AMOUNT: u64 = 4004;
+    /// Insufficient balance for withdrawal
+    const E_INSUFFICIENT_BALANCE: u64 = 4005;
 
-//     struct GlobalState has key {
-//         total_deposits: u64
-//     }
+    // === STRUCTS ===
+    struct DepositSlot has key {
+        loan_pos_addr: address,
+        lender: address,
+        principal: u64, // Số tiền gốc deposit
+        shares: u64, // Shares ownership trong pool
+        created_at_ts: u64, // Thời điểm tạo
+        active: bool,
+        last_deposit_ts: u64,
+        last_withdraw_ts: u64
+    }
 
-//     // === EVENTS ===
-//     #[event]
-//     struct DepositAdded has drop, store {
-//         deposit_slot: address,
-//         lender: address,
-//         amount: u64,
-//         new_shares: u64
-//     }
+    struct GlobalState has key {
+        total_deposits: u64
+    }
 
-//     #[event]
-//     struct LiquidityWithdrawn has drop, store {
-//         deposit_slot: address,
-//         lender: address,
-//         amount: u64,
-//         shares_burned: u64
-//     }
+    // === INIT ===
+    fun init_module(deployer: &signer) {
+        move_to(deployer, GlobalState { total_deposits: 0 });
+    }
 
-//     #[event]
-//     struct YieldClaimed has drop, store {
-//         deposit_slot: address,
-//         lender: address,
-//         yield_amount: u64
-//     }
+    // === CORE FUNCTIONS ===
 
-//     // === INIT (unchanged) ===
-//     fun init_module(deployer: &signer) {
-//         move_to(deployer, GlobalState { total_deposits: 0 });
-//     }
+    /// Create a new deposit slot for a lender
+    ///
+    /// Arguments:
+    /// * `lender` - Signer
+    /// * `loan_pos_addr` - The address of the associated loan position
+    /// * `principal` - The principal amount of the deposit
+    /// * `shares` - The shares allocated for this deposit
+    public(friend) fun create_deposit_slot(
+        lender: &signer,
+        loan_pos_addr: address,
+        principal: u64,
+        shares: u64
+    ): Object<DepositSlot> acquires GlobalState {
+        let ts = timestamp::now_seconds();
+        let deposit_info = DepositSlot {
+            loan_pos_addr,
+            lender: signer::address_of(lender),
+            principal,
+            shares,
+            created_at_ts: ts,
+            active: true,
+            last_deposit_ts: ts,
+            last_withdraw_ts: 0
+        };
 
-//     // === BASE CREATION (unchanged interface) ===
-//     public(friend) fun create_deposit_slot(
-//         lender: &signer,
-//         loan_position_addr: address,
-//         principal: u64,
-//         shares: u64,
-//         debt_idx_at_deposit: u128
-//     ): Object<DepositSlotInfo> acquires GlobalState {
-//         let state = borrow_global_mut<GlobalState>(@fered);
-//         let lender_addr = signer::address_of(lender);
-//         let constructor_ref = object::create_object(lender_addr);
-//         let container_signer = object::generate_signer(&constructor_ref);
+        let lender_addr = signer::address_of(lender);
+        let constructor_ref = object::create_object(lender_addr);
+        let container_signer = object::generate_signer(&constructor_ref);
 
-//         let deposit_info = DepositSlotInfo {
-//             loan_position_addr,
-//             lender: lender_addr,
-//             principal,
-//             shares,
-//             debt_idx_at_deposit,
-//             created_at: timestamp::now_seconds(),
-//             active: true,
-//             total_yield_claimed: 0,
-//             last_yield_claim: timestamp::now_seconds()
-//         };
+        move_to(&container_signer, deposit_info);
 
-//         move_to(&container_signer, deposit_info);
-//         state.total_deposits += 1;
+        let state = borrow_global_mut<GlobalState>(@fered);
+        state.total_deposits += 1;
 
-//         let deposit_obj =
-//             object::object_from_constructor_ref<DepositSlotInfo>(&constructor_ref);
-//         object::transfer(lender, deposit_obj, lender_addr);
-//         deposit_obj
-//     }
+        let deposit_slot_obj =
+            object::object_from_constructor_ref<DepositSlot>(&constructor_ref);
+        object::transfer(lender, deposit_slot_obj, lender_addr);
 
-//     // === ENHANCED LIQUIDITY FUNCTIONS ===
+        deposit_slot_obj
+    }
 
-//     /// Add more liquidity to existing deposit slot
-//     public fun deposit_liquidity<Token>(
-//         lender: &signer, deposit_slot: Object<DepositSlotInfo>, token: Coin<Token>
-//     ) acquires DepositSlotInfo {
-//         let slot_addr = object::object_address(&deposit_slot);
-//         let deposit_info = borrow_global_mut<DepositSlotInfo>(slot_addr);
-//         let amount = coin::value(&token);
+    /// Deposit more liquidity to existing or new deposit slot
+    ///
+    /// Returns:
+    /// * `new_shares` - The new shares allocated for this deposit
+    /// * `total_shares` - Total shares after deposit
+    /// * `position_percentage` - Percentage of total position (in basis points)
+    /// * `is_new_deposit` - Whether this is a new deposit or additional deposit
+    public(friend) fun deposit(
+        lender: &signer,
+        ds_obj: Object<DepositSlot>,
+        amount: u64,
+        total_pool_liquidity: u128,
+        total_pool_shares: u64
+    ): (u64, u64, u64, bool) acquires DepositSlot {
+        assert_is_owner(lender, ds_obj);
 
-//         assert!(deposit_info.lender == signer::address_of(lender), E_UNAUTHORIZED);
-//         assert!(deposit_info.active, E_POSITION_INACTIVE);
-//         assert!(amount > 0, E_INVALID_AMOUNT);
+        let deposit_slot = borrow_deposit_slot_mut(ds_obj);
+        assert!(deposit_slot.active, E_NOT_ACTIVE);
+        assert!(amount > 0, E_INVALID_AMOUNT);
 
-//         // Get current share price from loan position
-//         let loan_position =
-//             loan_position::lending_position(deposit_info.loan_position_addr);
-//         let new_shares = calculate_shares_for_deposit(loan_position, amount);
+        // Calculate shares based on current pool state
+        let new_shares =
+            if (total_pool_shares == 0 || total_pool_liquidity == 0) {
+                // First deposit in pool: shares = amount
+                amount
+            } else {
+                // shares = (amount * total_existing_shares) / total_existing_liquidity
+                math128::mul_div(
+                    amount as u128,
+                    total_pool_shares as u128,
+                    total_pool_liquidity
+                ) as u64
+            };
 
-//         // Update deposit info
-//         deposit_info.principal += amount;
-//         deposit_info.shares += new_shares;
+        let is_new_deposit = deposit_slot.principal == 0;
 
-//         // Add liquidity to underlying position
-//         loan_position::deposit_liquidity(loan_position, amount as u128);
+        // Update deposit info
+        deposit_slot.principal += amount;
+        deposit_slot.shares += new_shares;
+        deposit_slot.last_deposit_ts = timestamp::now_seconds();
 
-//         // Store token (simplified)
-//         coin::destroy_zero(token);
+        // Calculate position percentage in the pool (in basis points)
+        let new_total_shares = total_pool_shares + new_shares;
+        let position_percentage =
+            if (new_total_shares > 0) {
+                math128::mul_div(
+                    deposit_slot.shares as u128,
+                    bps() as u128,
+                    new_total_shares as u128
+                ) as u64
+            } else {
+                bps() // 100% if only deposit
+            };
 
-//         event::emit(
-//             DepositAdded {
-//                 deposit_slot: slot_addr,
-//                 lender: signer::address_of(lender),
-//                 amount,
-//                 new_shares
-//             }
-//         );
-//     }
+        (new_shares, deposit_slot.shares, position_percentage, is_new_deposit)
+    }
 
-//     /// Withdraw liquidity from deposit slot
-//     public fun withdraw_liquidity<Token>(
-//         lender: &signer, deposit_slot: Object<DepositSlotInfo>, shares_to_burn: u64
-//     ): Coin<Token> acquires DepositSlotInfo {
-//         let slot_addr = object::object_address(&deposit_slot);
-//         let deposit_info = borrow_global_mut<DepositSlotInfo>(slot_addr);
+    /// Withdraw liquidity based on amount
+    ///
+    /// Returns:
+    /// * `shares_burned` - The shares burned for this withdrawal
+    /// * `remaining_shares` - Remaining shares after withdrawal
+    /// * `position_percentage` - Updated percentage of total position (in basis points)
+    /// * `fully_withdrawn` - Whether the deposit is fully withdrawn
+    public(friend) fun withdraw(
+        lender: &signer,
+        ds_obj: Object<DepositSlot>,
+        amount: u64,
+        total_pool_liquidity: u128,
+        total_pool_shares: u64
+    ): (u64, u64, u64, bool) acquires DepositSlot {
+        assert_is_owner(lender, ds_obj);
 
-//         assert!(deposit_info.lender == signer::address_of(lender), E_UNAUTHORIZED);
-//         assert!(deposit_info.active, E_POSITION_INACTIVE);
-//         assert!(shares_to_burn <= deposit_info.shares, E_INSUFFICIENT_BALANCE);
-//         assert!(shares_to_burn > 0, E_INVALID_AMOUNT);
+        let deposit_slot = borrow_deposit_slot_mut(ds_obj);
+        assert!(deposit_slot.active, E_NOT_ACTIVE);
+        assert!(amount > 0, E_INVALID_AMOUNT);
 
-//         // Calculate amount to withdraw based on current share price
-//         let loan_position =
-//             loan_position::lending_position(deposit_info.loan_position_addr);
-//         let amount_to_withdraw =
-//             calculate_withdrawal_amount(loan_position, shares_to_burn);
+        // Calculate shares to burn based on current pool value
+        let shares_to_burn =
+            if (total_pool_liquidity > 0) {
+                math128::mul_div(
+                    amount as u128,
+                    total_pool_shares as u128,
+                    total_pool_liquidity
+                ) as u64
+            } else { 0 };
 
-//         // Update deposit info
-//         deposit_info.shares = deposit_info.shares - shares_to_burn;
-//         deposit_info.principal =
-//             if (deposit_info.principal > amount_to_withdraw) {
-//                 deposit_info.principal - amount_to_withdraw
-//             } else { 0 };
+        assert!(shares_to_burn <= deposit_slot.shares, E_INSUFFICIENT_BALANCE);
 
-//         // If all shares withdrawn, mark as inactive
-//         if (deposit_info.shares == 0) {
-//             deposit_info.active = false;
-//         };
+        // Update deposit info
+        deposit_slot.shares -= shares_to_burn;
+        deposit_slot.principal =
+            if (deposit_slot.principal >= amount) {
+                deposit_slot.principal - amount
+            } else { 0 };
+        deposit_slot.last_withdraw_ts = timestamp::now_seconds();
 
-//         event::emit(
-//             LiquidityWithdrawn {
-//                 deposit_slot: slot_addr,
-//                 lender: signer::address_of(lender),
-//                 amount: amount_to_withdraw,
-//                 shares_burned: shares_to_burn
-//             }
-//         );
+        let fully_withdrawn = deposit_slot.shares == 0;
 
-//         // Return token (simplified)
-//         coin::zero<Token>()
-//     }
+        // If fully withdrawn, mark as inactive
+        if (fully_withdrawn) {
+            deposit_slot.active = false;
+        };
 
-//     /// Claim accumulated yield
-//     public fun claim_yield<Token>(
-//         lender: &signer, deposit_slot: Object<DepositSlotInfo>
-//     ): Coin<Token> acquires DepositSlotInfo {
-//         let slot_addr = object::object_address(&deposit_slot);
-//         let deposit_info = borrow_global_mut<DepositSlotInfo>(slot_addr);
+        // Calculate updated position percentage
+        let new_total_shares = total_pool_shares - shares_to_burn;
+        let position_percentage =
+            if (new_total_shares > 0 && !fully_withdrawn) {
+                math128::mul_div(
+                    deposit_slot.shares as u128,
+                    bps() as u128,
+                    new_total_shares as u128
+                ) as u64
+            } else { 0 };
 
-//         assert!(deposit_info.lender == signer::address_of(lender), E_UNAUTHORIZED);
-//         assert!(deposit_info.active, E_POSITION_INACTIVE);
+        (shares_to_burn, deposit_slot.shares, position_percentage, fully_withdrawn)
+    }
 
-//         // Calculate claimable yield
-//         let loan_position =
-//             loan_position::lending_position(deposit_info.loan_position_addr);
-//         let claimable_yield = calculate_claimable_yield(deposit_info, loan_position);
+    // === VIEW FUNCTIONS ===
 
-//         assert!(claimable_yield > 0, E_INSUFFICIENT_BALANCE);
+    // Basic deposit slot information
+    public(friend) fun principal(deposit_slot_obj: Object<DepositSlot>): u64 acquires DepositSlot {
+        borrow_deposit_slot(deposit_slot_obj).principal
+    }
 
-//         // Update yield tracking
-//         deposit_info.total_yield_claimed =
-//             deposit_info.total_yield_claimed + claimable_yield;
-//         deposit_info.last_yield_claim = timestamp::now_seconds();
+    public(friend) fun shares(deposit_slot_obj: Object<DepositSlot>): u64 acquires DepositSlot {
+        borrow_deposit_slot(deposit_slot_obj).shares
+    }
 
-//         // Claim from loan position
-//         loan_position::claim_lender_yield(loan_position, deposit_info.lender);
+    public(friend) fun timestamp_created(
+        deposit_slot_obj: Object<DepositSlot>
+    ): u64 acquires DepositSlot {
+        borrow_deposit_slot(deposit_slot_obj).created_at_ts
+    }
 
-//         event::emit(
-//             YieldClaimed {
-//                 deposit_slot: slot_addr,
-//                 lender: signer::address_of(lender),
-//                 yield_amount: claimable_yield
-//             }
-//         );
+    public(friend) fun last_deposit_timestamp(
+        deposit_slot_obj: Object<DepositSlot>
+    ): u64 acquires DepositSlot {
+        borrow_deposit_slot(deposit_slot_obj).last_deposit_ts
+    }
 
-//         // Return yield tokens
-//         coin::zero<Token>()
-//     }
+    public(friend) fun last_withdraw_timestamp(
+        deposit_slot_obj: Object<DepositSlot>
+    ): u64 acquires DepositSlot {
+        borrow_deposit_slot(deposit_slot_obj).last_withdraw_ts
+    }
 
-//     /// Emergency withdraw (with penalty)
-//     public fun emergency_withdraw<Token>(
-//         lender: &signer, deposit_slot: Object<DepositSlotInfo>
-//     ): Coin<Token> acquires DepositSlotInfo {
-//         let slot_addr = object::object_address(&deposit_slot);
-//         let deposit_info = borrow_global_mut<DepositSlotInfo>(slot_addr);
+    // Status functions
+    public(friend) fun is_active(deposit_slot_obj: Object<DepositSlot>): bool acquires DepositSlot {
+        borrow_deposit_slot(deposit_slot_obj).active
+    }
 
-//         assert!(deposit_info.lender == signer::address_of(lender), E_UNAUTHORIZED);
-//         assert!(deposit_info.active, E_POSITION_INACTIVE);
+    public(friend) fun lender_address(
+        deposit_slot_obj: Object<DepositSlot>
+    ): address acquires DepositSlot {
+        borrow_deposit_slot(deposit_slot_obj).lender
+    }
 
-//         // Apply emergency withdrawal penalty (5%)
-//         let penalty_rate = 500; // 5%
-//         let gross_amount = deposit_info.principal;
-//         let penalty = (gross_amount * penalty_rate) / BASIS_POINTS;
-//         let net_amount = gross_amount - penalty;
+    public(friend) fun loan_position_address(
+        deposit_slot_obj: Object<DepositSlot>
+    ): address acquires DepositSlot {
+        borrow_deposit_slot(deposit_slot_obj).loan_pos_addr
+    }
 
-//         // Mark as inactive
-//         deposit_info.active = false;
-//         deposit_info.shares = 0;
+    // Global state view
+    public(friend) fun total_deposits(): u64 acquires GlobalState {
+        borrow_global<GlobalState>(@fered).total_deposits
+    }
 
-//         // Return net amount
-//         coin::zero<Token>()
-//     }
+    // Calculate current withdrawal value based on pool state
+    public(friend) fun current_withdrawal_value(
+        deposit_slot_obj: Object<DepositSlot>,
+        total_pool_liquidity: u128,
+        total_pool_shares: u64
+    ): u64 acquires DepositSlot {
+        let deposit_slot = borrow_deposit_slot(deposit_slot_obj);
 
-//     // === CALCULATION FUNCTIONS ===
+        if (total_pool_shares == 0 || total_pool_liquidity == 0) {
+            return 0
+        };
 
-//     fun calculate_shares_for_deposit(
-//         loan_position: Object<loan_position::LoanPosition>, amount: u64
-//     ): u64 {
-//         // Get share price from loan position
-//         let shares =
-//             loan_position::calculate_shares_for_amount(loan_position, amount as u128);
-//         shares as u64
-//     }
+        math128::mul_div(
+            deposit_slot.shares as u128,
+            total_pool_liquidity,
+            total_pool_shares as u128
+        ) as u64
+    }
 
-//     fun calculate_withdrawal_amount(
-//         loan_position: Object<loan_position::LoanPosition>, shares: u64
-//     ): u64 {
-//         // Calculate withdrawal amount based on current share price
-//         let (liquidity, _, _, _) = loan_position::get_position_info(loan_position);
-//         let (_, _, debt_index) = loan_position::get_interest_rates(loan_position);
+    // === HELPER FUNCTIONS ===
 
-//         // Simplified calculation
-//         (shares * (liquidity as u64)) / 1000000 // Would use proper share price
-//     }
+    inline fun borrow_deposit_slot(object: Object<DepositSlot>): &DepositSlot {
+        let addr = object::object_address(&object);
+        assert!(object::object_exists<DepositSlot>(addr), E_DEPOSIT_SLOT_NOT_FOUND);
+        borrow_global<DepositSlot>(addr)
+    }
 
-//     fun calculate_claimable_yield(
-//         deposit_info: &DepositSlotInfo, loan_position: Object<loan_position::LoanPosition>
-//     ): u64 {
-//         // Calculate yield based on shares and time elapsed
-//         let (_, pending_yields, yield_per_share) =
-//             loan_position::get_yield_info(loan_position);
-//         let total_entitled = ((deposit_info.shares as u128) * yield_per_share) / PRECISION;
-//         let claimable = total_entitled - (deposit_info.total_yield_claimed as u128);
+    inline fun borrow_deposit_slot_mut(object: Object<DepositSlot>): &mut DepositSlot {
+        let addr = object::object_address(&object);
+        assert!(object::object_exists<DepositSlot>(addr), E_DEPOSIT_SLOT_NOT_FOUND);
+        borrow_global_mut<DepositSlot>(addr)
+    }
 
-//         math64::min(claimable as u64, pending_yields as u64)
-//     }
+    fun assert_is_owner(signer: &signer, ds_obj: Object<DepositSlot>) {
+        let signer_addr = signer::address_of(signer);
+        assert!(
+            object::is_owner(ds_obj, signer_addr),
+            error::permission_denied(E_UNAUTHORIZED)
+        );
+    }
 
-//     // === VIEW FUNCTIONS ===
+    // === TESTS ===
 
-//     #[view]
-//     public fun get_deposit_info(
-//         deposit_slot: Object<DepositSlotInfo>
-//     ): (address, u64, u64, bool) acquires DepositSlotInfo {
-//         let deposit_info =
-//             borrow_global<DepositSlotInfo>(object::object_address(&deposit_slot));
-//         (
-//             deposit_info.lender,
-//             deposit_info.principal,
-//             deposit_info.shares,
-//             deposit_info.active
-//         )
-//     }
+    #[test_only]
+    fun init_for_test(deployer: &signer, aptos_framework: &signer) {
+        timestamp::set_time_has_started_for_testing(aptos_framework);
+        init_module(deployer);
+    }
 
-//     #[view]
-//     public fun get_extended_info(
-//         deposit_slot: Object<DepositSlotInfo>
-//     ): (u64, u64, u64, u128) acquires DepositSlotInfo {
-//         let deposit_info =
-//             borrow_global<DepositSlotInfo>(object::object_address(&deposit_slot));
-//         (
-//             deposit_info.created_at,
-//             deposit_info.total_yield_claimed,
-//             deposit_info.last_yield_claim,
-//             deposit_info.debt_idx_at_deposit
-//         )
-//     }
+    #[test(fered = @fered, aptos_framework = @0x1, lender = @0x123)]
+    fun test_create_deposit_slot_basic(
+        fered: &signer, aptos_framework: &signer, lender: &signer
+    ) acquires DepositSlot, GlobalState {
+        init_for_test(fered, aptos_framework);
 
-//     #[view]
-//     public fun calculate_current_value(
-//         deposit_slot: Object<DepositSlotInfo>
-//     ): (u64, u64) acquires DepositSlotInfo {
-//         let deposit_info =
-//             borrow_global<DepositSlotInfo>(object::object_address(&deposit_slot));
-//         let loan_position =
-//             loan_position::lending_position(deposit_info.loan_position_addr);
+        let loan_pos_addr = @0x456;
+        let principal = 1000u64;
+        let shares = 1000u64;
 
-//         let current_value =
-//             calculate_withdrawal_amount(loan_position, deposit_info.shares);
-//         let claimable_yield = calculate_claimable_yield(deposit_info, loan_position);
+        let deposit_obj = create_deposit_slot(lender, loan_pos_addr, principal, shares);
 
-//         (current_value, claimable_yield)
-//     }
+        // Verify deposit slot properties
+        assert!(principal(deposit_obj) == principal, 1);
+        assert!(shares(deposit_obj) == shares, 2);
+        assert!(is_active(deposit_obj), 3);
+        assert!(lender_address(deposit_obj) == signer::address_of(lender), 4);
+        assert!(total_deposits() == 1, 5);
+    }
 
-//     #[view]
-//     public fun get_position_summary(
-//         deposit_slot: Object<DepositSlotInfo>
-//     ): (address, u64, u64, u64, bool) acquires DepositSlotInfo {
-//         let deposit_info =
-//             borrow_global<DepositSlotInfo>(object::object_address(&deposit_slot));
-//         let loan_position =
-//             loan_position::lending_position(deposit_info.loan_position_addr);
-//         let (current_value, claimable_yield) = calculate_current_value(deposit_slot);
+    #[test(fered = @fered, aptos_framework = @0x1, lender = @0x123)]
+    fun test_deposit_first_in_pool(
+        fered: &signer, aptos_framework: &signer, lender: &signer
+    ) acquires DepositSlot, GlobalState {
+        init_for_test(fered, aptos_framework);
 
-//         (
-//             deposit_info.loan_position_addr,
-//             current_value,
-//             claimable_yield,
-//             deposit_info.shares,
-//             deposit_info.active
-//         )
-//     }
+        let deposit_obj = create_deposit_slot(lender, @0x456, 0, 0);
+        let amount = 1000u64;
+        let total_pool_liquidity = 0u128;
+        let total_pool_shares = 0u64;
 
-//     // === HELPER FUNCTIONS ===
+        let (new_shares, total_shares, position_pct, is_new) =
+            deposit(
+                lender,
+                deposit_obj,
+                amount,
+                total_pool_liquidity,
+                total_pool_shares
+            );
 
-//     inline fun borrow_deposit_slot(object: Object<DepositSlotInfo>): &DepositSlotInfo {
-//         let addr = object::object_address(&object);
-//         assert!(object::object_exists<DepositSlotInfo>(addr), E_DEPOSIT_SLOT_NOT_FOUND);
-//         borrow_global<DepositSlotInfo>(addr)
-//     }
+        assert!(new_shares == amount, 1); // First deposit: shares = amount
+        assert!(total_shares == amount, 2);
+        assert!(principal(deposit_obj) == amount, 3);
+        assert!(is_new, 4);
+        assert!(position_pct == bps(), 5); // 100%
+    }
 
-//     public fun is_deposit_active(
-//         deposit_slot: Object<DepositSlotInfo>
-//     ): bool acquires DepositSlotInfo {
-//         let deposit_info =
-//             borrow_global<DepositSlotInfo>(object::object_address(&deposit_slot));
-//         deposit_info.active
-//     }
+    #[test(fered = @fered, aptos_framework = @0x1, lender = @0x123)]
+    fun test_deposit_additional_liquidity(
+        fered: &signer, aptos_framework: &signer, lender: &signer
+    ) acquires DepositSlot, GlobalState {
+        init_for_test(fered, aptos_framework);
 
-//     public fun get_lender_address(
-//         deposit_slot: Object<DepositSlotInfo>
-//     ): address acquires DepositSlotInfo {
-//         let deposit_info =
-//             borrow_global<DepositSlotInfo>(object::object_address(&deposit_slot));
-//         deposit_info.lender
-//     }
-// }
+        let deposit_obj = create_deposit_slot(lender, @0x456, 1000, 1000);
+        let additional_amount = 500u64;
+        let total_pool_liquidity = 5000u128;
+        let total_pool_shares = 5000u64;
+
+        let (new_shares, total_shares, position_pct, is_new) =
+            deposit(
+                lender,
+                deposit_obj,
+                additional_amount,
+                total_pool_liquidity,
+                total_pool_shares
+            );
+
+        // shares = (500 * 5000) / 5000 = 500
+        assert!(new_shares == 500, 1);
+        assert!(total_shares == 1500, 2);
+        assert!(principal(deposit_obj) == 1500, 3);
+        assert!(!is_new, 4);
+        assert!(position_pct > 0, 5);
+    }
+
+    #[test(fered = @fered, aptos_framework = @0x1, lender = @0x123)]
+    fun test_withdraw_partial(
+        fered: &signer, aptos_framework: &signer, lender: &signer
+    ) acquires DepositSlot, GlobalState {
+        init_for_test(fered, aptos_framework);
+
+        let deposit_obj = create_deposit_slot(lender, @0x456, 1000, 1000);
+        let withdraw_amount = 300u64;
+        let total_pool_liquidity = 5000u128;
+        let total_pool_shares = 5000u64;
+
+        let (shares_burned, remaining_shares, position_pct, fully_withdrawn) =
+            withdraw(
+                lender,
+                deposit_obj,
+                withdraw_amount,
+                total_pool_liquidity,
+                total_pool_shares
+            );
+
+        // shares_burned = (300 * 5000) / 5000 = 300
+        assert!(shares_burned == 300, 1);
+        assert!(remaining_shares == 700, 2);
+        assert!(!fully_withdrawn, 3);
+        assert!(is_active(deposit_obj), 4);
+    }
+
+    #[test(fered = @fered, aptos_framework = @0x1, lender = @0x123)]
+    fun test_withdraw_full(
+        fered: &signer, aptos_framework: &signer, lender: &signer
+    ) acquires DepositSlot, GlobalState {
+        init_for_test(fered, aptos_framework);
+
+        let deposit_obj = create_deposit_slot(lender, @0x456, 1000, 1000);
+        let total_pool_liquidity = 1000u128;
+        let total_pool_shares = 1000u64;
+
+        let (shares_burned, remaining_shares, position_pct, fully_withdrawn) =
+            withdraw(
+                lender,
+                deposit_obj,
+                1000, // full amount
+                total_pool_liquidity,
+                total_pool_shares
+            );
+
+        assert!(shares_burned == 1000, 1);
+        assert!(remaining_shares == 0, 2);
+        assert!(fully_withdrawn, 3);
+        assert!(!is_active(deposit_obj), 4);
+        assert!(position_pct == 0, 5);
+    }
+
+    #[test(fered = @fered, aptos_framework = @0x1, lender = @0x123)]
+    fun test_current_withdrawal_value(
+        fered: &signer, aptos_framework: &signer, lender: &signer
+    ) acquires DepositSlot, GlobalState {
+        init_for_test(fered, aptos_framework);
+
+        let deposit_obj = create_deposit_slot(lender, @0x456, 1000, 1000);
+
+        // Pool has grown due to interest
+        let total_pool_liquidity = 6000u128; // 20% growth
+        let total_pool_shares = 5000u64;
+
+        let withdrawal_value =
+            current_withdrawal_value(
+                deposit_obj,
+                total_pool_liquidity,
+                total_pool_shares
+            );
+
+        // value = (1000 * 6000) / 5000 = 1200
+        assert!(withdrawal_value == 1200, 1);
+    }
+}
 
