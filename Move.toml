@@ -6,15 +6,12 @@ authors = []
 
 [addresses]
 fered = "_"
-admin = "_"
+admin = "0x57c528d90af4255748b37f3730afdda043fad019be735e7d899f5565840e0366"
 deployer = "0xd548f6e8ef91c57e7983b1051df686a3753f3d453d37ef781782450e61079fe9"
-dex_contract = "0x3673bee9e7b78ae63d4a9e3d58425bc97e7f3b8d68efc846ee732b14369333dd"
-usdc = "0xbae207659db88bea0cbead6da0ed00aac12edcdda169e591cd41c94180b46f3b"
-apt = "0x000000000000000000000000000000000000000000000000000000000000000a"
+dex_contract = "0x8b4a2c4bb53857c718a04c020b98f8c2e1f99a68b0f57389a8bf5434cd22e05c"
 
 [dev-addresses]
 fered = "0x111"
-admin = "0x222"
 
 [dependencies.AptosFramework]
 git = "https://github.com/aptos-labs/aptos-framework.git"

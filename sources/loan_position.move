@@ -1,13 +1,15 @@
 module fered::loan_position {
-    use std::vector;
     use aptos_framework::object::{Self, Object};
     use aptos_framework::account::{Self, SignerCapability};
+    use aptos_framework::aptos_coin::{Self};
     use aptos_framework::signer;
     use aptos_framework::timestamp;
     use aptos_framework::fungible_asset::{Self, Metadata};
     use aptos_framework::primary_fungible_store::{Self};
     use aptos_framework::math64;
     use aptos_framework::math128;
+    use aptos_framework::string;
+    use aptos_framework::option;
     use dex_contract::position_v3::Info;
     use dex_contract::router_v3;
     use dex_contract::pool_v3::{Self};
@@ -99,6 +101,7 @@ module fered::loan_position {
     }
 
     public entry fun create_loan_position(
+        creator: &signer,
         token_a: Object<Metadata>,
         token_b: Object<Metadata>,
         token_fee: Object<Metadata>,
@@ -117,12 +120,10 @@ module fered::loan_position {
             risk_factor
         );
         assert_token_fee(&token_fee, &token_a, &token_b);
-        let constructor_ref = object::create_object(@fered);
-        let lending_position_object =
-            object::object_from_constructor_ref<LoanPosition>(&constructor_ref);
+        let (_, cap_admin) = account::create_resource_account(creator, b"admin");
+        let signer_addr = signer::address_of(creator);
+        let constructor_ref = object::create_object(signer_addr);
         let container_signer = object::generate_signer(&constructor_ref);
-        let (signer_admin, cap_admin) =
-            account::create_resource_account(&container_signer, b"admin");
 
         let pos_object =
             pool_v3::open_position(
@@ -135,7 +136,7 @@ module fered::loan_position {
             );
 
         move_to(
-            &signer_admin,
+            &container_signer,
             LoanPosition {
                 pos_object,
                 liquidity: 0,
@@ -164,9 +165,9 @@ module fered::loan_position {
             }
         );
 
-        object::transfer(&signer_admin, lending_position_object, @fered);
+        let lending_position_object =
+            object::object_from_constructor_ref<LoanPosition>(&constructor_ref);
 
-        // Emit event
         events::emit_loan_position_created(
             object::object_address(&lending_position_object),
             token_a,
@@ -221,8 +222,11 @@ module fered::loan_position {
         pos.available_borrow = (pos.liquidity as u64) - pos.total_borrowed;
         pos.last_update_ts = timestamp::now_seconds();
 
+        let signer_admin =
+            &account::create_signer_with_capability(&pos.lending_position_cap.signer_cap);
+            
         router_v3::add_liquidity(
-            lender,
+            signer_admin,
             pos.pos_object,
             token_a,
             token_b,
@@ -234,14 +238,14 @@ module fered::loan_position {
             DEFAULT_DEADLINE_TS
         );
 
-        let deposit_slot_obj = deposit_slot::create_deposit_slot(
-            lender,
-            object::object_address(&position),
-            amount,
-            share as u64
-        );
+        let deposit_slot_obj =
+            deposit_slot::create_deposit_slot(
+                lender,
+                object::object_address(&position),
+                amount,
+                share as u64
+            );
 
-        // Emit event
         events::emit_liquidity_deposited(
             object::object_address(&position),
             signer::address_of(lender),
@@ -255,7 +259,7 @@ module fered::loan_position {
         );
     }
 
-    public fun deposit_liquidity_single(
+    public entry fun deposit_liquidity_single(
         lender: &signer,
         position: Object<LoanPosition>,
         from_a: Object<Metadata>,
@@ -279,8 +283,11 @@ module fered::loan_position {
         pos.available_borrow = (pos.liquidity as u64) - pos.total_borrowed;
         pos.last_update_ts = timestamp::now_seconds();
 
+        let signer_admin =
+            &account::create_signer_with_capability(&pos.lending_position_cap.signer_cap);
+            
         router_v3::add_liquidity_single(
-            lender,
+            signer_admin,
             pos.pos_object,
             from_a,
             to_b,
@@ -291,11 +298,11 @@ module fered::loan_position {
             threshold_denominator
         );
 
-        let deposit_slot_obj = deposit_slot::create_deposit_slot(
-            lender, pos_addr, amount_in as u128, share as u64
-        );
+        let deposit_slot_obj =
+            deposit_slot::create_deposit_slot(
+                lender, pos_addr, amount_in as u128, share as u64
+            );
 
-        // Emit event
         events::emit_liquidity_deposited(
             object::object_address(&position),
             signer::address_of(lender),
@@ -339,29 +346,31 @@ module fered::loan_position {
         // Update position state
         pos.available_borrow -= amount;
         pos.total_borrowed += amount;
-        
+
         // Handle edge case khi liquidity = 0
-        pos.utilization = if (pos.liquidity > 0) {
-            let util = (pos.total_borrowed * bps()) / (pos.liquidity as u64);
-            if (util > bps()) { bps() } else { util }
-        } else {
-            assert!(pos.total_borrowed == 0, E_INVALID_UTILIZATION);
-            0
-        };
+        pos.utilization =
+            if (pos.liquidity > 0) {
+                let util = (pos.total_borrowed * bps()) / (pos.liquidity as u64);
+                if (util > bps()) { bps() }
+                else { util }
+            } else {
+                assert!(pos.total_borrowed == 0, E_INVALID_UTILIZATION);
+                0
+            };
         pos.active_loans_count += 1;
         pos.last_update_ts = timestamp::now_seconds();
 
         // Create loan slot for borrower
-        let loan_slot_obj = loan_slot::create_loan_slot(
-            borrower,
-            object::object_address(&position),
-            amount,
-            0, // share will be calculated by loan_slot
-            reserve,
-            pos.current_debt_idx
-        );
+        let loan_slot_obj =
+            loan_slot::create_loan_slot(
+                borrower,
+                object::object_address(&position),
+                amount,
+                0, // share will be calculated by loan_slot
+                reserve,
+                pos.current_debt_idx
+            );
 
-        // Emit event
         events::emit_liquidity_borrowed(
             object::object_address(&position),
             signer::address_of(borrower),
@@ -395,7 +404,7 @@ module fered::loan_position {
         let current_debt_idx = pos.current_debt_idx;
         let apr = calculate_apr(pos, pos.utilization);
         let new_debt_idx = updated_debt_index(current_debt_idx, apr, time_elapsed);
-        
+
         // Emit debt index update event
         events::emit_debt_index_updated(
             object::object_address(&position),
@@ -405,24 +414,26 @@ module fered::loan_position {
             time_elapsed,
             current_ts
         );
-        
+
         pos.current_debt_idx = new_debt_idx;
         pos.last_accrual_ts = current_ts;
 
-        let (principal_repaid, _interest_repaid, loan_repaid, _) = 
+        let (principal_repaid, _interest_repaid, loan_repaid, _) =
             loan_slot::repay(owner, loan_slot, pos.current_debt_idx, amount);
 
         // Update position state
         pos.total_borrowed -= principal_repaid;
         pos.available_borrow += principal_repaid;
-        pos.utilization = if (pos.liquidity > 0) {
-            (pos.total_borrowed * bps()) / (pos.liquidity as u64)
-        } else { 0 };
+        pos.utilization =
+            if (pos.liquidity > 0) {
+                (pos.total_borrowed * bps()) / (pos.liquidity as u64)
+            } else { 0 };
 
         if (loan_repaid) {
-            pos.active_loans_count = if (pos.active_loans_count > 0) {
-                pos.active_loans_count - 1
-            } else { 0 };
+            pos.active_loans_count =
+                if (pos.active_loans_count > 0) {
+                    pos.active_loans_count - 1
+                } else { 0 };
         };
 
         let share = loan_slot::share(loan_slot);
@@ -434,10 +445,10 @@ module fered::loan_position {
     }
 
     inline fun claim_yield(
-        owner: &signer, 
+        owner: &signer,
         position: Object<LoanPosition>,
-        loan_slot: Object<LoanSlot>, 
-        pos: &mut LoanPosition, 
+        loan_slot: Object<LoanSlot>,
+        pos: &mut LoanPosition,
         share: u64
     ) {
         let admin_signer =
@@ -491,24 +502,26 @@ module fered::loan_position {
         primary_fungible_store::deposit(signer::address_of(&admin_signer), fee_asset_b);
 
         // Reward assets transfer
-        let reward_assets_count = vector::length(&rewared_assets);
-        rewared_assets.for_each(|asset| {
-            let amount_asset = fungible_asset::amount(&asset);
-            if (amount_asset > 0) {
-                let yield_amount_asset = 
-                    math128::mul_div(amount_asset as u128, ratio, precision()) as u64;
-                if (yield_amount_asset > 0) {
-                    primary_fungible_store::transfer(
-                        &admin_signer,
-                        fungible_asset::asset_metadata(&asset),
-                        signer::address_of(owner),
-                        yield_amount_asset
-                    );
+        let reward_assets_count = rewared_assets.length();
+        rewared_assets.for_each(
+            |asset| {
+                let amount_asset = fungible_asset::amount(&asset);
+                if (amount_asset > 0) {
+                    let yield_amount_asset =
+                        math128::mul_div(amount_asset as u128, ratio, precision()) as u64;
+                    if (yield_amount_asset > 0) {
+                        primary_fungible_store::transfer(
+                            &admin_signer,
+                            fungible_asset::asset_metadata(&asset),
+                            signer::address_of(owner),
+                            yield_amount_asset
+                        );
+                    };
                 };
-            };
-            // Deposit remaining reward asset to admin store
-            primary_fungible_store::deposit(signer::address_of(&admin_signer), asset);
-        });
+                // Deposit remaining reward asset to admin store
+                primary_fungible_store::deposit(signer::address_of(&admin_signer), asset);
+            }
+        );
 
         pos.total_interest_earned += yield_amount;
         pos.last_update_ts = timestamp::now_seconds();
@@ -530,15 +543,17 @@ module fered::loan_position {
         current_debt_idx: u128, apr: u64, time_elapsed: u64
     ): u128 {
         let seconds_per_year = 31_536_000; // 365 days
-        
-        let interest_rate_per_second = math128::mul_div(
-            apr as u128, 
-            time_elapsed as u128, 
-            (bps() as u128) * (seconds_per_year as u128)
-        );
-        
+
+        let interest_rate_per_second =
+            math128::mul_div(
+                apr as u128,
+                time_elapsed as u128,
+                (bps() as u128) * (seconds_per_year as u128)
+            );
+
         // Approximation: (1 + r) ≈ 1 + r for small r
-        current_debt_idx + math128::mul_div(current_debt_idx, interest_rate_per_second, precision())
+        current_debt_idx
+            + math128::mul_div(current_debt_idx, interest_rate_per_second, precision())
     }
 
     /// Calculate n^risk_power where risk_power is in bps
@@ -572,25 +587,26 @@ module fered::loan_position {
 
         if (utilization < params.kink_utilization) {
             // U < U_optimal
-            BASE_RATE_BPS + math64::mul_div(
-                params.slope_before_kink,
-                utilization,
-                params.kink_utilization
-            )
+            BASE_RATE_BPS
+                + math64::mul_div(
+                    params.slope_before_kink,
+                    utilization,
+                    params.kink_utilization
+                )
         } else {
             // U >= U_optimal: Đảm bảo smooth transition
             let base_rate = BASE_RATE_BPS + params.slope_before_kink;
-            
+
             if (utilization == params.kink_utilization) {
                 base_rate
             } else {
                 let excess_util = utilization - params.kink_utilization;
                 let max_excess = bps() - params.kink_utilization;
                 let excess_ratio = math64::mul_div(excess_util, bps(), max_excess);
-                
+
                 let risk_factor_bps = RISK_FACTOR_BFS_VECTOR[(params.risk_factor as u64)];
                 let power_term = calculate_power_bps(excess_ratio, risk_factor_bps);
-                
+
                 base_rate + math64::mul_div(params.slope_after_kink, power_term, bps())
             }
         }
@@ -598,9 +614,7 @@ module fered::loan_position {
 
     fun calculate_share(position: &LoanPosition, amount: u128): u128 {
         // Trường hợp đầu tiên - pool rỗng
-        if (position.total_share == 0 && position.liquidity == 0) { 
-            amount 
-        }
+        if (position.total_share == 0 && position.liquidity == 0) { amount }
         // Trường hợp bình thường
         else if (position.total_share > 0 && position.liquidity > 0) {
             math128::mul_div(amount, position.total_share, position.liquidity)
@@ -615,26 +629,29 @@ module fered::loan_position {
         pos: &LoanPosition, amount: u128, duration_idx: u8
     ): u64 {
         assert_valid_duration_index(duration_idx);
-        
+
         let apr = calculate_apr(pos, pos.utilization);
         let duration_year_bps = DURATION_YEAR_VECTOR_BPS[duration_idx as u64];
-        let multiplier_terms_adjustment_bps = MULTIPLIER_TERMS_ADJUSTMENT_BPS[duration_idx as u64];
+        let multiplier_terms_adjustment_bps =
+            MULTIPLIER_TERMS_ADJUSTMENT_BPS[duration_idx as u64];
         let risk_factor = pos.parameters.risk_factor;
 
-        let reserve = math128::mul_div(
+        let reserve =
             math128::mul_div(
                 math128::mul_div(
-                    amount * (apr as u128),
-                    duration_year_bps as u128,
-                    (bps() as u128)
+                    math128::mul_div(
+                        amount * (apr as u128),
+                        duration_year_bps as u128,
+                        (bps() as u128)
+                    ),
+                    (RISK_FACTOR_BFS_VECTOR[risk_factor as u64] as u128)
+                        * (multiplier_terms_adjustment_bps as u128),
+                    (bps() as u128) * (bps() as u128)
                 ),
-                (RISK_FACTOR_BFS_VECTOR[risk_factor as u64] as u128) * (multiplier_terms_adjustment_bps as u128),
-                (bps() as u128) * (bps() as u128)
-            ),
-            1,
-            bps() as u128
-        ) as u64;
-        
+                1,
+                bps() as u128
+            ) as u64;
+
         if (reserve == 0 && amount > 0) {
             1 // Minimum reserve là 1 unit
         } else {
@@ -694,7 +711,9 @@ module fered::loan_position {
     }
 
     /// Validate sufficient borrowable amount
-    fun assert_sufficient_available_borrow(position: &LoanPosition, amount: u64) {
+    fun assert_sufficient_available_borrow(
+        position: &LoanPosition, amount: u64
+    ) {
         assert!(amount <= position.available_borrow, E_INSUFFICIENT_AVAILABLE_BORROW);
     }
 
@@ -764,6 +783,48 @@ module fered::loan_position {
         else {
             (pos.total_borrowed * bps()) / (pos.liquidity as u64)
         }
+    }
+
+    // === TESTS ===
+    #[test_only]
+    fun init_for_testing(aptos_framework: &signer) {
+        timestamp::set_time_has_started_for_testing(aptos_framework);
+        aptos_coin::ensure_initialized_with_apt_fa_metadata_for_test();
+    }
+
+    #[test(aptos_framework = @0x1)]
+    fun test_create_loan_position_only(aptos_framework: &signer) {
+        init_for_testing(aptos_framework);
+
+        let (a_constructor_ref, _) = fungible_asset::create_test_token(aptos_framework);
+        primary_fungible_store::create_primary_store_enabled_fungible_asset(
+            &a_constructor_ref,
+            option::some(1_000_000_000),
+            string::utf8(b"Test A"),
+            string::utf8(b"TSTA"),
+            6,
+            string::utf8(b"test_a"),
+            string::utf8(b"https://example.com/tsta.png")
+        );
+        let mint_ref_a = fungible_asset::generate_mint_ref(&a_constructor_ref);
+        let fungible_a = fungible_asset::mint(&mint_ref_a, 1_000_000_000);
+        let token_a = fungible_asset::asset_metadata(&fungible_a);
+
+        create_loan_position(
+            aptos_framework,
+            token_a,
+            object::address_to_object<Metadata>(@0xa),
+            token_a,
+            1,
+            32768 - 120,
+            120,
+            2000,
+            4000,
+            8000,
+            1
+        );
+
+        fungible_asset::destroy_zero(fungible_a);
     }
 }
 
