@@ -22,6 +22,10 @@ module fered::deposit_slot {
     const E_INVALID_AMOUNT: u64 = 4004;
     /// Insufficient balance for withdrawal
     const E_INSUFFICIENT_BALANCE: u64 = 4005;
+    /// Zero principal amount
+    const E_ZERO_PRINCIPAL: u64 = 4006;
+    /// Zero shares amount
+    const E_ZERO_SHARES: u64 = 4007;
 
     // === STRUCTS ===
     struct DepositSlot has key {
@@ -102,10 +106,10 @@ module fered::deposit_slot {
         total_pool_shares: u64
     ): (u64, u64, u64, bool) acquires DepositSlot {
         assert_is_owner(lender, ds_obj);
+        assert_valid_amount(amount);
 
         let deposit_slot = borrow_deposit_slot_mut(ds_obj);
-        assert!(deposit_slot.active, E_NOT_ACTIVE);
-        assert!(amount > 0, E_INVALID_AMOUNT);
+        assert_is_active(deposit_slot);
 
         // Calculate shares based on current pool state
         let new_shares =
@@ -159,10 +163,10 @@ module fered::deposit_slot {
         total_pool_shares: u64
     ): (u64, u64, u64, bool) acquires DepositSlot {
         assert_is_owner(lender, ds_obj);
+        assert_valid_amount(amount);
 
         let deposit_slot = borrow_deposit_slot_mut(ds_obj);
-        assert!(deposit_slot.active, E_NOT_ACTIVE);
-        assert!(amount > 0, E_INVALID_AMOUNT);
+        assert_is_active(deposit_slot);
 
         // Calculate shares to burn based on current pool value
         let shares_to_burn =
@@ -174,7 +178,7 @@ module fered::deposit_slot {
                 ) as u64
             } else { 0 };
 
-        assert!(shares_to_burn <= deposit_slot.shares, E_INSUFFICIENT_BALANCE);
+        assert_sufficient_shares(deposit_slot, shares_to_burn);
 
         // Update deposit info
         deposit_slot.shares -= shares_to_burn;
@@ -203,6 +207,35 @@ module fered::deposit_slot {
             } else { 0 };
 
         (shares_to_burn, deposit_slot.shares, position_percentage, fully_withdrawn)
+    }
+
+    // === ASSERT FUNCTIONS ===
+    fun assert_is_owner(signer: &signer, ds_obj: Object<DepositSlot>) {
+        let signer_addr = signer::address_of(signer);
+        assert!(
+            object::is_owner(ds_obj, signer_addr),
+            error::permission_denied(E_UNAUTHORIZED)
+        );
+    }
+
+    fun assert_is_active(deposit_slot: &DepositSlot) {
+        assert!(deposit_slot.active, E_NOT_ACTIVE);
+    }
+
+    fun assert_valid_amount(amount: u128) {
+        assert!(amount > 0, E_INVALID_AMOUNT);
+    }
+
+    fun assert_sufficient_shares(deposit_slot: &DepositSlot, required_shares: u64) {
+        assert!(required_shares <= deposit_slot.shares, E_INSUFFICIENT_BALANCE);
+    }
+
+    fun assert_non_zero_principal(principal: u128) {
+        assert!(principal > 0, E_ZERO_PRINCIPAL);
+    }
+
+    fun assert_non_zero_shares(shares: u64) {
+        assert!(shares > 0, E_ZERO_SHARES);
     }
 
     // === VIEW FUNCTIONS ===
@@ -287,14 +320,6 @@ module fered::deposit_slot {
         let addr = object::object_address(&object);
         assert!(object::object_exists<DepositSlot>(addr), E_DEPOSIT_SLOT_NOT_FOUND);
         borrow_global_mut<DepositSlot>(addr)
-    }
-
-    fun assert_is_owner(signer: &signer, ds_obj: Object<DepositSlot>) {
-        let signer_addr = signer::address_of(signer);
-        assert!(
-            object::is_owner(ds_obj, signer_addr),
-            error::permission_denied(E_UNAUTHORIZED)
-        );
     }
 
     // === TESTS ===
@@ -456,4 +481,3 @@ module fered::deposit_slot {
         assert!(withdrawal_value == 1200, 1);
     }
 }
-

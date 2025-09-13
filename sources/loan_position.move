@@ -1,4 +1,5 @@
 module fered::loan_position {
+    use std::vector;
     use aptos_framework::object::{Self, Object};
     use aptos_framework::account::{Self, SignerCapability};
     use aptos_framework::signer;
@@ -7,16 +8,16 @@ module fered::loan_position {
     use aptos_framework::primary_fungible_store::{Self};
     use aptos_framework::math64;
     use aptos_framework::math128;
-    use aptos_framework::vector;
     use dex_contract::position_v3::Info;
     use dex_contract::router_v3;
     use dex_contract::pool_v3::{Self};
-    use fered::deposit_slot::{Self, DepositSlot};
+    use fered::deposit_slot::{Self};
     use fered::loan_slot::{Self, LoanSlot};
     use fered::math::{bps, precision};
 
     // === CONSTANTS ===
     const BASE_RATE_BPS: u64 = 0; // 0%
+    const BONUS_LIQUIDITY_BPS: u64 = 500; // 5%
     const DEFAULT_DEADLINE_TS: u64 = 0xffff_ffff_ffff_ffff;
     const RISK_FACTOR_BFS_VECTOR: vector<u64> = vector[5000, 10000, 15000, 20000]; // 50%, 100%, 150%, 200%
     const DURATION_YEAR_VECTOR_BPS: vector<u64> = vector[2500, 5000, 10000, 20000]; // 25%, 50%, 100%, 200%
@@ -49,10 +50,6 @@ module fered::loan_position {
     const E_BORROW_EXCEEDS_AVAILABLE: u64 = 1012;
     /// Invalid debt index
     const E_INVALID_DEBT_INDEX: u64 = 1013;
-    /// Position not ready for liquidation
-    const E_NOT_LIQUIDATABLE: u64 = 1014;
-    /// Invalid liquidation threshold
-    const E_INVALID_LIQUIDATION_THRESHOLD: u64 = 1015;
     /// Invalid token fee
     const E_INVALID_TOKEN_FEE: u64 = 1016;
     /// Invalid duration index
@@ -179,6 +176,9 @@ module fered::loan_position {
         amount_a_min: u64,
         amount_b_min: u64
     ) acquires LoanPosition {
+        assert_valid_amount(amount_a_desired);
+        assert_valid_amount(amount_b_desired);
+
         let pos = borrow_loan_position_mut(position);
         assert_position_active(pos);
 
@@ -195,13 +195,14 @@ module fered::loan_position {
                 amount_b_min
             );
         let amount = liquidity_minted;
-        assert!(amount > 0, E_INVALID_AMOUNT);
+        assert_valid_amount(amount as u64);
 
         let share = calculate_share(pos, amount);
 
         pos.total_share += share;
         pos.liquidity += amount as u128;
-        pos.available_borrow = pos.liquidity as u64;
+        // FIX: Tính available_borrow chính xác
+        pos.available_borrow = (pos.liquidity as u64) - pos.total_borrowed;
         pos.last_update_ts = timestamp::now_seconds();
 
         router_v3::add_liquidity(
@@ -236,17 +237,18 @@ module fered::loan_position {
         threshold_numerator: u256,
         threshold_denominator: u256
     ) acquires LoanPosition {
-        assert!(amount_in > 0, E_INVALID_AMOUNT);
+        assert_valid_amount(amount_in);
 
-        let pos_adrr = object::object_address(&position);
-        let pos = borrow_global_mut<LoanPosition>(pos_adrr);
+        let pos_addr = object::object_address(&position);
+        let pos = borrow_global_mut<LoanPosition>(pos_addr);
         assert_position_active(pos);
 
         let share = calculate_share(pos, amount_in as u128);
 
         pos.total_share += share;
         pos.liquidity += amount_in as u128;
-        pos.available_borrow = pos.liquidity as u64;
+        // FIX: Tính available_borrow chính xác  
+        pos.available_borrow = (pos.liquidity as u64) - pos.total_borrowed;
         pos.last_update_ts = timestamp::now_seconds();
 
         router_v3::add_liquidity_single(
@@ -262,7 +264,7 @@ module fered::loan_position {
         );
 
         deposit_slot::create_deposit_slot(
-            lender, pos_adrr, amount_in as u128, share as u64
+            lender, pos_addr, amount_in as u128, share as u64
         );
     }
 
@@ -273,18 +275,19 @@ module fered::loan_position {
         amount: u64,
         duration_idx: u8
     ) acquires LoanPosition {
-        assert!(amount > 0, E_INVALID_AMOUNT);
+        assert_valid_amount(amount);
+        assert_valid_duration_index(duration_idx);
 
         let pos = borrow_loan_position_mut(position);
         assert_position_active(pos);
         assert_token_fee_of_loan_position(pos, &token_fee);
-
-        assert!(amount <= pos.available_borrow, E_BORROW_EXCEEDS_AVAILABLE);
+        assert_sufficient_available_borrow(pos, amount);
 
         let reserve = calculate_reserve(pos, amount as u128, duration_idx);
         let admin_signer =
             account::create_signer_with_capability(&pos.lending_position_cap.signer_cap);
 
+        // Transfer reserve from borrower to loan position
         primary_fungible_store::transfer(
             borrower,
             token_fee,
@@ -292,13 +295,32 @@ module fered::loan_position {
             reserve
         );
 
+        // Update position state
         pos.available_borrow -= amount;
         pos.total_borrowed += amount;
-        pos.utilization =
-            if (pos.liquidity > 0) {
-                (pos.total_borrowed * bps()) / (pos.liquidity as u64)
-            } else { 0 };
+        
+        // FIX: Handle edge case khi liquidity = 0
+        pos.utilization = if (pos.liquidity > 0) {
+            let util = (pos.total_borrowed * bps()) / (pos.liquidity as u64);
+            // Đảm bảo không vượt quá 100%
+            if (util > bps()) { bps() } else { util }
+        } else {
+            // Nếu liquidity = 0 mà vẫn có total_borrowed thì có vấn đề
+            assert!(pos.total_borrowed == 0, E_INVALID_UTILIZATION);
+            0
+        };
+        pos.active_loans_count += 1;
         pos.last_update_ts = timestamp::now_seconds();
+
+        // Create loan slot for borrower
+        loan_slot::create_loan_slot(
+            borrower,
+            object::object_address(&position),
+            amount,
+            0, // share will be calculated by loan_slot
+            reserve,
+            pos.current_debt_idx
+        );
     }
 
     public entry fun loan_slot_claim_yield_and_repay(
@@ -307,31 +329,47 @@ module fered::loan_position {
         loan_slot: Object<LoanSlot>,
         amount: u64
     ) acquires LoanPosition {
-        assert!(amount > 0, E_INVALID_AMOUNT);
+        assert_valid_amount(amount);
 
         let pos = borrow_loan_position_mut(position);
         assert_position_active(pos);
 
         let current_ts = timestamp::now_seconds();
         let time_elapsed = current_ts - pos.last_accrual_ts;
-        assert!(time_elapsed > 0, E_INVALID_TIME_ELAPSED);
+        assert_valid_time_elapsed(time_elapsed);
 
         let current_debt_idx = pos.current_debt_idx;
-        let admin_signer =
-            account::create_signer_with_capability(&pos.lending_position_cap.signer_cap);
         let apr = calculate_apr(pos, pos.utilization);
         let new_debt_idx = updated_debt_index(current_debt_idx, apr, time_elapsed);
         pos.current_debt_idx = new_debt_idx;
         pos.last_accrual_ts = current_ts;
 
-        let share = loan_slot::share(loan_slot);
+        let (principal_repaid, _interest_repaid, loan_repaid, _) = 
+            loan_slot::repay(owner, loan_slot, pos.current_debt_idx, amount);
 
+        // Update position state
+        pos.total_borrowed -= principal_repaid;
+        pos.available_borrow += principal_repaid;
+        pos.utilization = if (pos.liquidity > 0) {
+            (pos.total_borrowed * bps()) / (pos.liquidity as u64)
+        } else { 0 };
+
+        if (loan_repaid) {
+            pos.active_loans_count = if (pos.active_loans_count > 0) {
+                pos.active_loans_count - 1
+            } else { 0 };
+        };
+
+        let share = loan_slot::share(loan_slot);
+        if (share > 0) {
+            claim_yield(owner, pos, share);
+        };
+
+        pos.last_update_ts = current_ts;
     }
 
     inline fun claim_yield(
-        owner: &signer,
-        pos: &mut LoanPosition,
-        share: u64
+        owner: &signer, pos: &mut LoanPosition, share: u64
     ) {
         let admin_signer =
             account::create_signer_with_capability(&pos.lending_position_cap.signer_cap);
@@ -341,8 +379,7 @@ module fered::loan_position {
         );
 
         let yield_amount = math128::mul_div(share as u128, pos.liquidity, pos.total_share);
-
-        assert!(yield_amount > 0, E_INVALID_AMOUNT);
+        assert_valid_amount(yield_amount as u64);
 
         let (fee_asset_a, fee_asset_b) =
             pool_v3::claim_fees(&admin_signer, pos.pos_object);
@@ -361,6 +398,7 @@ module fered::loan_position {
         let yield_fee_asset_b =
             math128::mul_div(amount_fee_asset_b as u128, ratio, precision());
 
+        // Transfer yield portion to owner, deposit remainder back to admin
         if (yield_fee_asset_a > 0) {
             primary_fungible_store::transfer(
                 &admin_signer,
@@ -379,20 +417,28 @@ module fered::loan_position {
             );
         };
 
+        // Deposit remaining fee assets to admin store
+        primary_fungible_store::deposit(signer::address_of(&admin_signer), fee_asset_a);
+        primary_fungible_store::deposit(signer::address_of(&admin_signer), fee_asset_b);
+
         // Reward assets transfer
-        rewared_assets.for_each(
-            |asset| {
-                let amount_asset = fungible_asset::amount(&asset);
-                if (amount_asset > 0) {
+        rewared_assets.for_each(|asset| {
+            let amount_asset = fungible_asset::amount(&asset);
+            if (amount_asset > 0) {
+                let yield_amount_asset = 
+                    math128::mul_div(amount_asset as u128, ratio, precision()) as u64;
+                if (yield_amount_asset > 0) {
                     primary_fungible_store::transfer(
                         &admin_signer,
                         fungible_asset::asset_metadata(&asset),
                         signer::address_of(owner),
-                        amount_asset
+                        yield_amount_asset
                     );
                 };
-            }
-        );
+            };
+            // Deposit remaining reward asset to admin store
+            primary_fungible_store::deposit(signer::address_of(&admin_signer), asset);
+        });
 
         pos.total_interest_earned += yield_amount;
         pos.last_update_ts = timestamp::now_seconds();
@@ -401,12 +447,20 @@ module fered::loan_position {
     fun updated_debt_index(
         current_debt_idx: u128, apr: u64, time_elapsed: u64
     ): u128 {
-        // new_debt_idx = current_debt_idx * (1 + apr * (time_elapsed / seconds_per_year))
         let seconds_per_year = 31_536_000; // 365 days
-        let interest_factor =
-            math128::mul_div(apr as u128, time_elapsed as u128, seconds_per_year as u128);
-        current_debt_idx
-            + math128::mul_div(current_debt_idx, interest_factor, bps() as u128)
+        
+        // FIX: Sử dụng compound interest formula
+        // new_debt_idx = current_debt_idx * (1 + apr/bps())^(time_elapsed/seconds_per_year)
+        // Đơn giản hóa: current_debt_idx * (1 + apr * time_elapsed / (bps * seconds_per_year))
+        
+        let interest_rate_per_second = math128::mul_div(
+            apr as u128, 
+            time_elapsed as u128, 
+            (bps() as u128) * (seconds_per_year as u128)
+        );
+        
+        // Approximation: (1 + r) ≈ 1 + r for small r
+        current_debt_idx + math128::mul_div(current_debt_idx, interest_rate_per_second, precision())
     }
 
     /// Calculate n^risk_power where risk_power is in bps
@@ -434,88 +488,81 @@ module fered::loan_position {
         }
     }
 
-    #[view]
-    public fun calculate_apr(pos: &LoanPosition, utilization: u64): u64 acquires LoanPosition {
-        assert!(utilization <= bps(), E_INVALID_UTILIZATION);
-
+    fun calculate_apr(pos: &LoanPosition, utilization: u64): u64 {
+        assert_valid_utilization(utilization);
         let params = &pos.parameters;
 
-        if (utilization <= params.kink_utilization) {
-            // U <= U_optimal: R_base + Slope1 * (U / U_optimal)
-            BASE_RATE_BPS
-                + math64::mul_div(
-                    params.slope_before_kink,
-                    utilization,
-                    params.kink_utilization
-                )
+        if (utilization < params.kink_utilization) {
+            // U < U_optimal
+            BASE_RATE_BPS + math64::mul_div(
+                params.slope_before_kink,
+                utilization,
+                params.kink_utilization
+            )
         } else {
-            // U > U_optimal: R_base + Slope1 + Slope2 * ((U - U_optimal) / (1 - U_optimal))^risk_factor
-            let excess_util = utilization - params.kink_utilization;
-            let max_excess = bps() - params.kink_utilization;
-            let excess_ratio = math64::mul_div(excess_util, bps(), max_excess);
-
-            // Get risk factor from vector
-            let risk_factor_bps = RISK_FACTOR_BFS_VECTOR[(params.risk_factor as u64)];
-            let power_term = calculate_power_bps(excess_ratio, risk_factor_bps);
-
-            BASE_RATE_BPS + params.slope_before_kink
-                + math64::mul_div(params.slope_after_kink, power_term, bps())
+            // U >= U_optimal: Đảm bảo smooth transition
+            let base_rate = BASE_RATE_BPS + params.slope_before_kink;
+            
+            if (utilization == params.kink_utilization) {
+                base_rate
+            } else {
+                let excess_util = utilization - params.kink_utilization;
+                let max_excess = bps() - params.kink_utilization;
+                let excess_ratio = math64::mul_div(excess_util, bps(), max_excess);
+                
+                let risk_factor_bps = RISK_FACTOR_BFS_VECTOR[(params.risk_factor as u64)];
+                let power_term = calculate_power_bps(excess_ratio, risk_factor_bps);
+                
+                base_rate + math64::mul_div(params.slope_after_kink, power_term, bps())
+            }
         }
     }
 
-    #[view]
-    fun calculate_liquidation_threshold(
-        util_bps: u64, safety_multiplier_bps: u64
-    ): u64 {
-        let initial_ltv =
-            math128::mul_div(
-                util_bps as u128,
-                bps() as u128,
-                (bps() - util_bps) as u128
-            ) as u64;
-
-        let threshold_with_safety =
-            math128::mul_div(
-                initial_ltv as u128,
-                safety_multiplier_bps as u128,
-                bps() as u128
-            ) as u64;
-
-        let buffer = 300;
-
-        threshold_with_safety + buffer
-    }
-
     fun calculate_share(position: &LoanPosition, amount: u128): u128 {
-        if (position.total_share == 0 || position.liquidity == 0) { amount }
-        else {
+        // Trường hợp đầu tiên - pool rỗng
+        if (position.total_share == 0 && position.liquidity == 0) { 
+            amount 
+        }
+        // Trường hợp bình thường
+        else if (position.total_share > 0 && position.liquidity > 0) {
             math128::mul_div(amount, position.total_share, position.liquidity)
+        }
+        // Trường hợp lỗi - không nên xảy ra
+        else {
+            abort E_INVALID_AMOUNT
         }
     }
 
     fun calculate_reserve(
         pos: &LoanPosition, amount: u128, duration_idx: u8
     ): u64 {
+        assert_valid_duration_index(duration_idx);
+        
         let apr = calculate_apr(pos, pos.utilization);
-        let duration_year_bps = DURATION_YEAR_VECTOR_BPS[duration_idx];
-        let multiplier_terms_adjustment_bps =
-            MULTIPLIER_TERMS_ADJUSTMENT_BPS[duration_idx];
+        let duration_year_bps = DURATION_YEAR_VECTOR_BPS[duration_idx as u64];
+        let multiplier_terms_adjustment_bps = MULTIPLIER_TERMS_ADJUSTMENT_BPS[duration_idx as u64];
         let risk_factor = pos.parameters.risk_factor;
 
-        // Reserve = amount * apr * duration_year_bps * risk_factor * multiplier_terms_adjustment_bps / (bps^3)
-        math128::mul_div(
+        let reserve = math128::mul_div(
             math128::mul_div(
                 math128::mul_div(
-                    math128::mul_div(amount, apr as u128, duration_year_bps as u128),
-                    RISK_FACTOR_BFS_VECTOR[risk_factor as u64] as u128,
-                    bps() as u128
+                    amount * (apr as u128),
+                    duration_year_bps as u128,
+                    (bps() as u128)
                 ),
-                multiplier_terms_adjustment_bps as u128,
-                bps() as u128
+                (RISK_FACTOR_BFS_VECTOR[risk_factor as u64] as u128) * (multiplier_terms_adjustment_bps as u128),
+                (bps() as u128) * (bps() as u128)
             ),
             1,
             bps() as u128
-        ) as u64
+        ) as u64;
+        
+        // FIX: Đảm bảo reserve minimum
+        if (reserve == 0 && amount > 0) {
+            1 // Minimum reserve là 1 unit
+        } else {
+            reserve
+        }
     }
 
     #[view]
@@ -549,6 +596,42 @@ module fered::loan_position {
         assert!(
             (risk_factor as u64) < RISK_FACTOR_BFS_VECTOR.length(), E_INVALID_RISK_FACTOR
         );
+    }
+
+    /// Validate amount is greater than zero
+    fun assert_valid_amount(amount: u64) {
+        assert!(amount > 0, E_INVALID_AMOUNT);
+    }
+
+    /// Validate debt index is valid
+    fun assert_valid_debt_index(debt_idx: u128) {
+        assert!(debt_idx >= precision(), E_INVALID_DEBT_INDEX);
+    }
+
+    /// Validate duration index
+    fun assert_valid_duration_index(duration_idx: u8) {
+        assert!(
+            (duration_idx as u64) < DURATION_YEAR_VECTOR_BPS.length(),
+            E_INVALID_DURATION_INDEX
+        );
+    }
+
+    /// Validate sufficient borrowable amount
+    fun assert_sufficient_available_borrow(position: &LoanPosition, amount: u64) {
+        assert!(amount <= position.available_borrow, E_INSUFFICIENT_AVAILABLE_BORROW);
+    }
+
+    /// Validate time elapsed is positive
+    fun assert_valid_time_elapsed(time_elapsed: u64) {
+        assert!(time_elapsed > 0, E_INVALID_TIME_ELAPSED);
+        // FIX: Thêm upper bound để tránh overflow
+        let max_time_elapsed = 365 * 24 * 3600; // 1 năm tối đa
+        assert!(time_elapsed <= max_time_elapsed, E_INVALID_TIME_ELAPSED);
+    }
+
+    /// Validate utilization rate
+    fun assert_valid_utilization(utilization: u64) {
+        assert!(utilization <= bps(), E_INVALID_UTILIZATION);
     }
 
     fun assert_token_fee(
@@ -605,38 +688,6 @@ module fered::loan_position {
         else {
             (pos.total_borrowed * bps()) / (pos.liquidity as u64)
         }
-    }
-
-    /// Check if position can be liquidated
-    public fun is_liquidatable(
-        position: Object<LoanPosition>, current_debt_idx: u128, liquidation_threshold: u64
-    ): bool acquires LoanPosition {
-        assert!(current_debt_idx >= precision(), E_INVALID_DEBT_INDEX);
-        assert!(
-            liquidation_threshold > 0 && liquidation_threshold <= bps(),
-            E_INVALID_LIQUIDATION_THRESHOLD
-        );
-
-        let pos = borrow_loan_position(position);
-        if (!pos.active) {
-            return false
-        };
-
-        let current_debt =
-            math128::mul_div(
-                pos.total_borrowed as u128,
-                current_debt_idx,
-                pos.current_debt_idx
-            ) as u64;
-
-        let current_ltv =
-            if (pos.liquidity > 0) {
-                (current_debt * bps()) / (pos.liquidity as u64)
-            } else {
-                bps() // 100% if no liquidity
-            };
-
-        current_ltv >= liquidation_threshold
     }
 }
 
