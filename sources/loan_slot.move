@@ -6,6 +6,7 @@ module fered::loan_slot {
     use aptos_framework::math64;
     use aptos_framework::math128;
     use aptos_framework::error;
+    use fered::events;
 
     friend fered::loan_position;
 
@@ -31,7 +32,8 @@ module fered::loan_slot {
     // === STRUCTS ===
     struct LoanSlot has key {
         loan_pos_addr: address,
-        principal: u64,
+        principal: u64,              // Current remaining principal
+        original_principal: u64,     // Original principal for accurate debt calculation
         share: u64,
         reserve: u64,
         debt_idx_at_borrow: u128,
@@ -69,6 +71,7 @@ module fered::loan_slot {
         let borrow_info = LoanSlot {
             loan_pos_addr,
             principal,
+            original_principal: principal,  // Store original principal
             share,
             reserve,
             debt_idx_at_borrow,
@@ -90,6 +93,19 @@ module fered::loan_slot {
         let loan_slot_obj = object::object_from_constructor_ref<LoanSlot>(&constructor_ref);
         object::transfer(borrower, loan_slot_obj, borrower_addr);
 
+        // Emit event
+        events::emit_loan_slot_created(
+            object::object_address(&loan_slot_obj),
+            borrower_addr,
+            loan_pos_addr,
+            principal,
+            principal, // original_principal same as principal at creation
+            share,
+            reserve,
+            debt_idx_at_borrow,
+            ts
+        );
+
         loan_slot_obj
     }
 
@@ -103,17 +119,26 @@ module fered::loan_slot {
         assert_valid_debt_index(current_debt_idx);
         assert_non_zero_amount(amount);
         
+        // Check active status BEFORE calling repay
+        let loan_slot = borrow_loan_slot_mut(ls_obj);
+        assert_is_active(loan_slot);
+
         let (principal_portion, interest_portion, loan_repaid, new_debt_idx) =
             repay(borrower, ls_obj, current_debt_idx, amount);
 
+        // Re-borrow after repay since repay might have modified state
         let loan_slot = borrow_loan_slot_mut(ls_obj);
-        assert_is_active(loan_slot);
-        assert_non_zero_principal(principal_portion);
+        
+        // Only check principal_portion if loan is still active
+        if (!loan_repaid) {
+            assert_non_zero_principal(principal_portion);
+        };
 
+        // Calculate reserve proportional to original principal
         let reserve_to_withdraw = math128::mul_div(
             loan_slot.reserve as u128,
             principal_portion as u128,
-            (principal_portion + loan_slot.principal) as u128
+            loan_slot.original_principal as u128
         ) as u64;
 
         loan_slot.withdrawn_amount += reserve_to_withdraw;
@@ -121,6 +146,19 @@ module fered::loan_slot {
             if (loan_slot.available_withdraw >= reserve_to_withdraw) {
                 loan_slot.available_withdraw - reserve_to_withdraw
             } else { 0 };
+
+        // Emit event
+        events::emit_loan_withdrawn(
+            object::object_address(&ls_obj),
+            signer::address_of(borrower),
+            amount,
+            reserve_to_withdraw,
+            principal_portion,
+            interest_portion,
+            loan_slot.principal,
+            loan_repaid,
+            timestamp::now_seconds()
+        );
 
         (reserve_to_withdraw, interest_portion, loan_repaid, new_debt_idx)
     }
@@ -140,16 +178,21 @@ module fered::loan_slot {
             return (0, 0, false, current_debt_idx);
         };
 
+        // Use original_principal for debt calculation consistency
         let principal_scaled = math128::mul_div(
-            (loan_slot.principal as u128),
+            (loan_slot.original_principal as u128),
             current_debt_idx,
             loan_slot.debt_idx_at_borrow
         );
         
         let amount_u128 = amount as u128;
+        // Correct logic for principal vs interest calculation
         let (principal_portion, interest_portion) = if (amount_u128 >= principal_scaled) {
-            (loan_slot.principal, (amount_u128 - principal_scaled) as u64)
+            // Full repayment: pay all remaining principal + interest
+            let interest = (principal_scaled - (loan_slot.principal as u128)) as u64;
+            (loan_slot.principal, interest)
         } else {
+            // Partial repayment: calculate how much goes to principal vs interest
             let principal_portion = math128::mul_div(
                 amount_u128,
                 loan_slot.debt_idx_at_borrow,
@@ -167,15 +210,22 @@ module fered::loan_slot {
             loan_slot.active = false;
         };
 
-        let new_debt_idx = if (loan_slot.principal == 0) {
-            current_debt_idx
-        } else {
-            math128::mul_div(
-                (loan_slot.principal as u128),
-                current_debt_idx,
-                principal_scaled
-            )
-        };
+        // Don't modify debt index per loan slot - it should remain global
+        // Debt index represents the global accumulated interest rate
+        let new_debt_idx = current_debt_idx;
+
+        // Emit event
+        events::emit_loan_repaid(
+            object::object_address(&ls_obj),
+            signer::address_of(borrower),
+            amount,
+            principal_portion,
+            interest_portion,
+            loan_slot.principal,
+            loan_repaid,
+            new_debt_idx,
+            loan_slot.last_payment_ts
+        );
 
         (principal_portion, interest_portion, loan_repaid, new_debt_idx)
     }
@@ -253,6 +303,10 @@ module fered::loan_slot {
         borrow_loan_slot(loan_slot_obj).principal
     }
 
+    public fun original_principal(loan_slot_obj: Object<LoanSlot>): u64 acquires LoanSlot {
+        borrow_loan_slot(loan_slot_obj).original_principal
+    }
+
     public fun share(loan_slot_obj: Object<LoanSlot>): u64 acquires LoanSlot {
         borrow_loan_slot(loan_slot_obj).share
     }
@@ -272,8 +326,9 @@ module fered::loan_slot {
     public fun current_debt(loan_slot_obj: Object<LoanSlot>, current_debt_idx: u128): u64 
         acquires LoanSlot {
         let loan_slot = borrow_loan_slot(loan_slot_obj);
+        // Use original_principal for accurate debt calculation
         math128::mul_div(
-            loan_slot.principal as u128,
+            loan_slot.original_principal as u128,
             current_debt_idx,
             loan_slot.debt_idx_at_borrow
         ) as u64

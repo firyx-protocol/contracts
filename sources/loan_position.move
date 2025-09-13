@@ -14,6 +14,7 @@ module fered::loan_position {
     use fered::deposit_slot::{Self};
     use fered::loan_slot::{Self, LoanSlot};
     use fered::math::{bps, precision};
+    use fered::events;
 
     // === CONSTANTS ===
     const BASE_RATE_BPS: u64 = 0; // 0%
@@ -164,6 +165,22 @@ module fered::loan_position {
         );
 
         object::transfer(&signer_admin, lending_position_object, @fered);
+
+        // Emit event
+        events::emit_loan_position_created(
+            object::object_address(&lending_position_object),
+            token_a,
+            token_b,
+            token_fee,
+            fee_tier,
+            tick_lower,
+            tick_upper,
+            slope_before_kink,
+            slope_after_kink,
+            kink_utilization,
+            risk_factor,
+            timestamp::now_seconds()
+        );
     }
 
     public entry fun deposit_liquidity(
@@ -200,8 +217,7 @@ module fered::loan_position {
         let share = calculate_share(pos, amount);
 
         pos.total_share += share;
-        pos.liquidity += amount as u128;
-        // FIX: Tính available_borrow chính xác
+        pos.liquidity += amount;
         pos.available_borrow = (pos.liquidity as u64) - pos.total_borrowed;
         pos.last_update_ts = timestamp::now_seconds();
 
@@ -218,11 +234,24 @@ module fered::loan_position {
             DEFAULT_DEADLINE_TS
         );
 
-        deposit_slot::create_deposit_slot(
+        let deposit_slot_obj = deposit_slot::create_deposit_slot(
             lender,
             object::object_address(&position),
             amount,
             share as u64
+        );
+
+        // Emit event
+        events::emit_liquidity_deposited(
+            object::object_address(&position),
+            signer::address_of(lender),
+            object::object_address(&deposit_slot_obj),
+            amount,
+            share as u64,
+            pos.liquidity,
+            pos.total_share,
+            pos.utilization,
+            pos.last_update_ts
         );
     }
 
@@ -247,7 +276,6 @@ module fered::loan_position {
 
         pos.total_share += share;
         pos.liquidity += amount_in as u128;
-        // FIX: Tính available_borrow chính xác  
         pos.available_borrow = (pos.liquidity as u64) - pos.total_borrowed;
         pos.last_update_ts = timestamp::now_seconds();
 
@@ -263,8 +291,21 @@ module fered::loan_position {
             threshold_denominator
         );
 
-        deposit_slot::create_deposit_slot(
+        let deposit_slot_obj = deposit_slot::create_deposit_slot(
             lender, pos_addr, amount_in as u128, share as u64
+        );
+
+        // Emit event
+        events::emit_liquidity_deposited(
+            object::object_address(&position),
+            signer::address_of(lender),
+            object::object_address(&deposit_slot_obj),
+            amount_in as u128,
+            share as u64,
+            pos.liquidity,
+            pos.total_share,
+            pos.utilization,
+            pos.last_update_ts
         );
     }
 
@@ -299,13 +340,11 @@ module fered::loan_position {
         pos.available_borrow -= amount;
         pos.total_borrowed += amount;
         
-        // FIX: Handle edge case khi liquidity = 0
+        // Handle edge case khi liquidity = 0
         pos.utilization = if (pos.liquidity > 0) {
             let util = (pos.total_borrowed * bps()) / (pos.liquidity as u64);
-            // Đảm bảo không vượt quá 100%
             if (util > bps()) { bps() } else { util }
         } else {
-            // Nếu liquidity = 0 mà vẫn có total_borrowed thì có vấn đề
             assert!(pos.total_borrowed == 0, E_INVALID_UTILIZATION);
             0
         };
@@ -313,13 +352,28 @@ module fered::loan_position {
         pos.last_update_ts = timestamp::now_seconds();
 
         // Create loan slot for borrower
-        loan_slot::create_loan_slot(
+        let loan_slot_obj = loan_slot::create_loan_slot(
             borrower,
             object::object_address(&position),
             amount,
             0, // share will be calculated by loan_slot
             reserve,
             pos.current_debt_idx
+        );
+
+        // Emit event
+        events::emit_liquidity_borrowed(
+            object::object_address(&position),
+            signer::address_of(borrower),
+            object::object_address(&loan_slot_obj),
+            amount,
+            reserve,
+            duration_idx,
+            pos.current_debt_idx,
+            pos.utilization,
+            pos.total_borrowed,
+            pos.available_borrow,
+            pos.last_update_ts
         );
     }
 
@@ -341,6 +395,17 @@ module fered::loan_position {
         let current_debt_idx = pos.current_debt_idx;
         let apr = calculate_apr(pos, pos.utilization);
         let new_debt_idx = updated_debt_index(current_debt_idx, apr, time_elapsed);
+        
+        // Emit debt index update event
+        events::emit_debt_index_updated(
+            object::object_address(&position),
+            current_debt_idx,
+            new_debt_idx,
+            apr,
+            time_elapsed,
+            current_ts
+        );
+        
         pos.current_debt_idx = new_debt_idx;
         pos.last_accrual_ts = current_ts;
 
@@ -362,14 +427,18 @@ module fered::loan_position {
 
         let share = loan_slot::share(loan_slot);
         if (share > 0) {
-            claim_yield(owner, pos, share);
+            claim_yield(owner, position, loan_slot, pos, share);
         };
 
         pos.last_update_ts = current_ts;
     }
 
     inline fun claim_yield(
-        owner: &signer, pos: &mut LoanPosition, share: u64
+        owner: &signer, 
+        position: Object<LoanPosition>,
+        loan_slot: Object<LoanSlot>, 
+        pos: &mut LoanPosition, 
+        share: u64
     ) {
         let admin_signer =
             account::create_signer_with_capability(&pos.lending_position_cap.signer_cap);
@@ -422,6 +491,7 @@ module fered::loan_position {
         primary_fungible_store::deposit(signer::address_of(&admin_signer), fee_asset_b);
 
         // Reward assets transfer
+        let reward_assets_count = vector::length(&rewared_assets);
         rewared_assets.for_each(|asset| {
             let amount_asset = fungible_asset::amount(&asset);
             if (amount_asset > 0) {
@@ -442,16 +512,24 @@ module fered::loan_position {
 
         pos.total_interest_earned += yield_amount;
         pos.last_update_ts = timestamp::now_seconds();
+
+        // Emit yield claimed event
+        events::emit_yield_claimed(
+            object::object_address(&position),
+            signer::address_of(owner),
+            object::object_address(&loan_slot),
+            yield_amount,
+            amount_fee_asset_a as u64,
+            amount_fee_asset_b as u64,
+            reward_assets_count as u64,
+            pos.last_update_ts
+        );
     }
 
     fun updated_debt_index(
         current_debt_idx: u128, apr: u64, time_elapsed: u64
     ): u128 {
         let seconds_per_year = 31_536_000; // 365 days
-        
-        // FIX: Sử dụng compound interest formula
-        // new_debt_idx = current_debt_idx * (1 + apr/bps())^(time_elapsed/seconds_per_year)
-        // Đơn giản hóa: current_debt_idx * (1 + apr * time_elapsed / (bps * seconds_per_year))
         
         let interest_rate_per_second = math128::mul_div(
             apr as u128, 
@@ -557,7 +635,6 @@ module fered::loan_position {
             bps() as u128
         ) as u64;
         
-        // FIX: Đảm bảo reserve minimum
         if (reserve == 0 && amount > 0) {
             1 // Minimum reserve là 1 unit
         } else {
@@ -624,7 +701,6 @@ module fered::loan_position {
     /// Validate time elapsed is positive
     fun assert_valid_time_elapsed(time_elapsed: u64) {
         assert!(time_elapsed > 0, E_INVALID_TIME_ELAPSED);
-        // FIX: Thêm upper bound để tránh overflow
         let max_time_elapsed = 365 * 24 * 3600; // 1 năm tối đa
         assert!(time_elapsed <= max_time_elapsed, E_INVALID_TIME_ELAPSED);
     }

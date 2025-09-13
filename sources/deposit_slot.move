@@ -5,6 +5,7 @@ module fered::deposit_slot {
     use aptos_framework::math128;
     use aptos_framework::error;
     use fered::math::{bps};
+    use fered::events;
 
     friend fered::loan_position;
 
@@ -31,21 +32,26 @@ module fered::deposit_slot {
     struct DepositSlot has key {
         loan_pos_addr: address,
         lender: address,
-        principal: u128, // Số tiền gốc deposit
-        shares: u64, // Shares ownership trong pool
-        created_at_ts: u64, // Thời điểm tạo
+        original_principal: u128,      // Original deposit amount
+        accumulated_deposits: u128,    // Total amount deposited
+        shares: u64,                  // Shares ownership trong pool
+        created_at_ts: u64,
         active: bool,
         last_deposit_ts: u64,
         last_withdraw_ts: u64
     }
 
     struct GlobalState has key {
-        total_deposits: u64
+        total_deposits: u64,
+        active_deposits: u64
     }
 
     // === INIT ===
     fun init_module(deployer: &signer) {
-        move_to(deployer, GlobalState { total_deposits: 0 });
+        move_to(deployer, GlobalState { 
+            total_deposits: 0,
+            active_deposits: 0 
+        });
     }
 
     // === CORE FUNCTIONS ===
@@ -67,7 +73,8 @@ module fered::deposit_slot {
         let deposit_info = DepositSlot {
             loan_pos_addr,
             lender: signer::address_of(lender),
-            principal,
+            original_principal: principal,
+            accumulated_deposits: principal,
             shares,
             created_at_ts: ts,
             active: true,
@@ -83,10 +90,21 @@ module fered::deposit_slot {
 
         let state = borrow_global_mut<GlobalState>(@fered);
         state.total_deposits += 1;
+        state.active_deposits += 1;
 
         let deposit_slot_obj =
             object::object_from_constructor_ref<DepositSlot>(&constructor_ref);
         object::transfer(lender, deposit_slot_obj, lender_addr);
+
+        // Emit event
+        events::emit_deposit_slot_created(
+            object::object_address(&deposit_slot_obj),
+            lender_addr,
+            loan_pos_addr,
+            principal,
+            shares,
+            ts
+        );
 
         deposit_slot_obj
     }
@@ -113,22 +131,24 @@ module fered::deposit_slot {
 
         // Calculate shares based on current pool state
         let new_shares =
-            if (total_pool_shares == 0 || total_pool_liquidity == 0) {
+            if (total_pool_shares == 0 && total_pool_liquidity == 0) {
                 // First deposit in pool: shares = amount
                 (amount as u64)
-            } else {
+            } else if (total_pool_shares > 0 && total_pool_liquidity > 0) {
                 // shares = (amount * total_existing_shares) / total_existing_liquidity
                 math128::mul_div(
                     amount,
                     total_pool_shares as u128,
                     total_pool_liquidity
                 ) as u64
+            } else {
+                abort E_INVALID_AMOUNT
             };
 
-        let is_new_deposit = deposit_slot.principal == 0;
+        let is_new_deposit = deposit_slot.accumulated_deposits == 0;
 
         // Update deposit info
-        deposit_slot.principal += amount;
+        deposit_slot.accumulated_deposits += amount;
         deposit_slot.shares += new_shares;
         deposit_slot.last_deposit_ts = timestamp::now_seconds();
 
@@ -144,6 +164,19 @@ module fered::deposit_slot {
             } else {
                 bps() // 100% if only deposit
             };
+
+        // Emit event
+        events::emit_deposit_added(
+            object::object_address(&ds_obj),
+            signer::address_of(lender),
+            amount,
+            new_shares,
+            deposit_slot.shares,
+            deposit_slot.accumulated_deposits,
+            position_percentage,
+            is_new_deposit,
+            deposit_slot.last_deposit_ts
+        );
 
         (new_shares, deposit_slot.shares, position_percentage, is_new_deposit)
     }
@@ -161,7 +194,7 @@ module fered::deposit_slot {
         amount: u128,
         total_pool_liquidity: u128,
         total_pool_shares: u64
-    ): (u64, u64, u64, bool) acquires DepositSlot {
+    ): (u64, u64, u64, bool) acquires DepositSlot, GlobalState {
         assert_is_owner(lender, ds_obj);
         assert_valid_amount(amount);
 
@@ -170,21 +203,33 @@ module fered::deposit_slot {
 
         // Calculate shares to burn based on current pool value
         let shares_to_burn =
-            if (total_pool_liquidity > 0) {
+            if (total_pool_shares > 0 && total_pool_liquidity > 0) {
                 math128::mul_div(
                     amount,
                     total_pool_shares as u128,
                     total_pool_liquidity
                 ) as u64
-            } else { 0 };
+            } else if (total_pool_shares == 0 && total_pool_liquidity == 0) {
+                (amount as u64)
+            } else {
+                abort E_INVALID_AMOUNT
+            };
 
         assert_sufficient_shares(deposit_slot, shares_to_burn);
 
-        // Update deposit info
+        // Update deposit info based on shares burned, not amount
         deposit_slot.shares -= shares_to_burn;
-        deposit_slot.principal =
-            if (deposit_slot.principal >= amount) {
-                deposit_slot.principal - amount
+        let withdrawal_value = if (total_pool_shares > 0) {
+            math128::mul_div(
+                shares_to_burn as u128,
+                total_pool_liquidity,
+                total_pool_shares as u128
+            )
+        } else { amount };
+        
+        deposit_slot.accumulated_deposits = 
+            if (deposit_slot.accumulated_deposits >= withdrawal_value) {
+                deposit_slot.accumulated_deposits - withdrawal_value
             } else { 0 };
         deposit_slot.last_withdraw_ts = timestamp::now_seconds();
 
@@ -193,6 +238,9 @@ module fered::deposit_slot {
         // If fully withdrawn, mark as inactive
         if (fully_withdrawn) {
             deposit_slot.active = false;
+            // Update global state
+            let state = borrow_global_mut<GlobalState>(@fered);
+            state.active_deposits -= 1;
         };
 
         // Calculate updated position percentage
@@ -205,6 +253,19 @@ module fered::deposit_slot {
                     new_total_shares as u128
                 ) as u64
             } else { 0 };
+
+        // Emit event
+        events::emit_deposit_withdrawn(
+            object::object_address(&ds_obj),
+            signer::address_of(lender),
+            amount,
+            shares_to_burn,
+            deposit_slot.shares,
+            deposit_slot.accumulated_deposits,
+            position_percentage,
+            fully_withdrawn,
+            deposit_slot.last_withdraw_ts
+        );
 
         (shares_to_burn, deposit_slot.shares, position_percentage, fully_withdrawn)
     }
@@ -241,8 +302,12 @@ module fered::deposit_slot {
     // === VIEW FUNCTIONS ===
 
     // Basic deposit slot information
-    public fun principal(deposit_slot_obj: Object<DepositSlot>): u128 acquires DepositSlot {
-        borrow_deposit_slot(deposit_slot_obj).principal
+    public fun original_principal(deposit_slot_obj: Object<DepositSlot>): u128 acquires DepositSlot {
+        borrow_deposit_slot(deposit_slot_obj).original_principal
+    }
+
+    public fun accumulated_deposits(deposit_slot_obj: Object<DepositSlot>): u128 acquires DepositSlot {
+        borrow_deposit_slot(deposit_slot_obj).accumulated_deposits
     }
 
     public fun shares(deposit_slot_obj: Object<DepositSlot>): u64 acquires DepositSlot {
@@ -289,6 +354,10 @@ module fered::deposit_slot {
         borrow_global<GlobalState>(@fered).total_deposits
     }
 
+    public fun active_deposits(): u64 acquires GlobalState {
+        borrow_global<GlobalState>(@fered).active_deposits
+    }
+
     // Calculate current withdrawal value based on pool state
     public fun current_withdrawal_value(
         deposit_slot_obj: Object<DepositSlot>,
@@ -297,15 +366,17 @@ module fered::deposit_slot {
     ): u128 acquires DepositSlot {
         let deposit_slot = borrow_deposit_slot(deposit_slot_obj);
 
-        if (total_pool_shares == 0 || total_pool_liquidity == 0) {
+        if (total_pool_shares == 0 && total_pool_liquidity == 0) {
+            return deposit_slot.accumulated_deposits
+        } else if (total_pool_shares > 0 && total_pool_liquidity > 0) {
+            return math128::mul_div(
+                deposit_slot.shares as u128,
+                total_pool_liquidity,
+                total_pool_shares as u128
+            )
+        } else {
             return 0
-        };
-
-        math128::mul_div(
-            deposit_slot.shares as u128,
-            total_pool_liquidity,
-            total_pool_shares as u128
-        )
+        }
     }
 
     // === HELPER FUNCTIONS ===
@@ -343,7 +414,7 @@ module fered::deposit_slot {
         let deposit_obj = create_deposit_slot(lender, loan_pos_addr, principal, shares);
 
         // Verify deposit slot properties
-        assert!(principal(deposit_obj) == principal, 1);
+        assert!(accumulated_deposits(deposit_obj) == principal, 1);
         assert!(shares(deposit_obj) == shares, 2);
         assert!(is_active(deposit_obj), 3);
         assert!(lender_address(deposit_obj) == signer::address_of(lender), 4);
@@ -372,7 +443,7 @@ module fered::deposit_slot {
 
         assert!(new_shares == (amount as u64), 1); // First deposit: shares = amount
         assert!(total_shares == (amount as u64), 2);
-        assert!(principal(deposit_obj) == amount, 3);
+        assert!(accumulated_deposits(deposit_obj) == amount, 3);
         assert!(is_new, 4);
         assert!(position_pct == bps(), 5); // 100%
     }
@@ -400,7 +471,7 @@ module fered::deposit_slot {
         // shares = (500 * 5000) / 5000 = 500
         assert!(new_shares == 500, 1);
         assert!(total_shares == 1500, 2);
-        assert!(principal(deposit_obj) == 1500, 3);
+        assert!(accumulated_deposits(deposit_obj) == 1500, 3);
         assert!(!is_new, 4);
         assert!(position_pct > 0, 5);
     }
@@ -416,7 +487,7 @@ module fered::deposit_slot {
         let total_pool_liquidity = 5000u128;
         let total_pool_shares = 5000u64;
 
-        let (shares_burned, remaining_shares, position_pct, fully_withdrawn) =
+        let (shares_burned, remaining_shares, _position_pct, fully_withdrawn) =
             withdraw(
                 lender,
                 deposit_obj,
