@@ -1,1 +1,1 @@
-aptos move deploy-object --profile default --address-name fered --max-gas 900000 --assume-yes
+aptos move deploy-object --profile default --address-name firyx --max-gas 900000 --assume-yes

@@ -1,4 +1,4 @@
-module fered::loan_position {
+module firyx::loan_position {
     use aptos_framework::object::{Self, Object};
     use aptos_framework::account::{Self, SignerCapability};
     use aptos_framework::aptos_coin::{Self};
@@ -10,13 +10,15 @@ module fered::loan_position {
     use aptos_framework::math128;
     use aptos_framework::string;
     use aptos_framework::option;
+    use aptos_framework::bcs;
+    use aptos_framework::vector;
     use dex_contract::position_v3::Info;
     use dex_contract::router_v3;
     use dex_contract::pool_v3::{Self};
-    use fered::deposit_slot::{Self};
-    use fered::loan_slot::{Self, LoanSlot};
-    use fered::math::{bps, precision};
-    use fered::events;
+    use firyx::deposit_slot::{Self, DepositSlot};
+    use firyx::loan_slot::{Self, LoanSlot};
+    use firyx::math::{bps, precision};
+    use firyx::events;
 
     // === CONSTANTS ===
     const BASE_RATE_BPS: u64 = 0; // 0%
@@ -85,6 +87,8 @@ module fered::loan_position {
         liquidity: u128,
         utilization: u64,
         current_debt_idx: u128,
+        fee_growth_global_a: u128,
+        fee_growth_global_b: u128,
         available_borrow: u64,
         total_borrowed: u64,
         parameters: LoanPositionParameters,
@@ -120,14 +124,24 @@ module fered::loan_position {
             risk_factor
         );
         assert_token_fee(&token_fee, &token_a, &token_b);
-        let (_, cap_admin) = account::create_resource_account(creator, b"admin");
+
+        let _seed_vector = vector[
+            bcs::to_bytes(&token_a), bcs::to_bytes(&token_b), bcs::to_bytes(&fee_tier), bcs::to_bytes(
+                &tick_lower
+            ), bcs::to_bytes(&tick_upper), bcs::to_bytes(&slope_before_kink), bcs::to_bytes(
+                &slope_after_kink
+            ), bcs::to_bytes(&kink_utilization), bcs::to_bytes(&risk_factor)
+        ];
+
+        let seed = bcs::to_bytes(&_seed_vector);
+        let (signer_admin, cap_admin) = account::create_resource_account(creator, seed);
         let signer_addr = signer::address_of(creator);
         let constructor_ref = object::create_object(signer_addr);
         let container_signer = object::generate_signer(&constructor_ref);
 
         let pos_object =
             pool_v3::open_position(
-                &container_signer,
+                &signer_admin,
                 token_a,
                 token_b,
                 fee_tier,
@@ -142,6 +156,8 @@ module fered::loan_position {
                 liquidity: 0,
                 utilization: 0,
                 current_debt_idx: precision(),
+                fee_growth_global_a: 0,
+                fee_growth_global_b: 0,
                 available_borrow: 0,
                 total_borrowed: 0,
                 parameters: LoanPositionParameters {
@@ -216,7 +232,6 @@ module fered::loan_position {
         assert_valid_amount(amount as u64);
 
         let share = calculate_share(pos, amount);
-
         pos.total_share += share;
         pos.liquidity += amount;
         pos.available_borrow = (pos.liquidity as u64) - pos.total_borrowed;
@@ -224,7 +239,7 @@ module fered::loan_position {
 
         let signer_admin =
             &account::create_signer_with_capability(&pos.lending_position_cap.signer_cap);
-            
+
         router_v3::add_liquidity(
             signer_admin,
             pos.pos_object,
@@ -245,6 +260,13 @@ module fered::loan_position {
                 amount,
                 share as u64
             );
+
+        // Initialize fee growth debt for new deposit slot
+        deposit_slot::update_fee_growth_debt(
+            deposit_slot_obj,
+            pos.fee_growth_global_a,
+            pos.fee_growth_global_b
+        );
 
         events::emit_liquidity_deposited(
             object::object_address(&position),
@@ -285,7 +307,14 @@ module fered::loan_position {
 
         let signer_admin =
             &account::create_signer_with_capability(&pos.lending_position_cap.signer_cap);
-            
+
+        primary_fungible_store::transfer(
+            lender,
+            from_a,
+            signer::address_of(signer_admin),
+            amount_in
+        );
+
         router_v3::add_liquidity_single(
             signer_admin,
             pos.pos_object,
@@ -302,6 +331,13 @@ module fered::loan_position {
             deposit_slot::create_deposit_slot(
                 lender, pos_addr, amount_in as u128, share as u64
             );
+
+        // Initialize fee growth debt for new deposit slot
+        deposit_slot::update_fee_growth_debt(
+            deposit_slot_obj,
+            pos.fee_growth_global_a,
+            pos.fee_growth_global_b
+        );
 
         events::emit_liquidity_deposited(
             object::object_address(&position),
@@ -360,16 +396,24 @@ module fered::loan_position {
         pos.active_loans_count += 1;
         pos.last_update_ts = timestamp::now_seconds();
 
+        let share = calculate_share(pos, amount as u128);
         // Create loan slot for borrower
         let loan_slot_obj =
             loan_slot::create_loan_slot(
                 borrower,
                 object::object_address(&position),
-                amount,
-                0, // share will be calculated by loan_slot
+                amount as u128,
+                share,
                 reserve,
                 pos.current_debt_idx
             );
+
+        // Initialize fee growth debt for new loan slot
+        loan_slot::update_fee_growth_debt(
+            loan_slot_obj,
+            pos.fee_growth_global_a,
+            pos.fee_growth_global_b
+        );
 
         events::emit_liquidity_borrowed(
             object::object_address(&position),
@@ -436,23 +480,54 @@ module fered::loan_position {
                 } else { 0 };
         };
 
+        pos.last_update_ts = current_ts;
+
         let share = loan_slot::share(loan_slot);
         if (share > 0) {
-            claim_yield(owner, position, loan_slot, pos, share);
-        };
+            let (
+                yield_amount, amount_fee_asset_a, amount_fee_asset_b, reward_assets_count
+            ) = loan_slot_claim_yield_internal(owner, pos, loan_slot);
 
-        pos.last_update_ts = current_ts;
+            events::emit_yield_claimed(
+                object::object_address(&position),
+                signer::address_of(owner),
+                object::object_address(&loan_slot),
+                yield_amount,
+                amount_fee_asset_a,
+                amount_fee_asset_b,
+                reward_assets_count,
+                pos.last_update_ts
+            );
+        };
     }
 
-    inline fun claim_yield(
-        owner: &signer,
-        position: Object<LoanPosition>,
-        loan_slot: Object<LoanSlot>,
-        pos: &mut LoanPosition,
-        share: u64
-    ) {
+    public entry fun deposit_slot_claim_yield(
+        owner: &signer, position: Object<LoanPosition>, deposit_slot: Object<DepositSlot>
+    ) acquires LoanPosition {
+        let pos = borrow_loan_position_mut(position);
+        assert_position_active(pos);
+
+        let (yield_amount, amount_fee_asset_a, amount_fee_asset_b, reward_assets_count) =
+            deposit_slot_claim_yield_internal(owner, pos, deposit_slot);
+
+        events::emit_yield_claimed(
+            object::object_address(&position),
+            signer::address_of(owner),
+            object::object_address(&deposit_slot),
+            yield_amount,
+            amount_fee_asset_a as u64,
+            amount_fee_asset_b as u64,
+            reward_assets_count as u64,
+            pos.last_update_ts
+        );
+    }
+
+    fun deposit_slot_claim_yield_internal(
+        owner: &signer, pos: &mut LoanPosition, deposit_slot: Object<DepositSlot>
+    ): (u128, u64, u64, u64) {
         let admin_signer =
             account::create_signer_with_capability(&pos.lending_position_cap.signer_cap);
+        let share = deposit_slot::share(deposit_slot);
         assert!(
             share > 0 && (share as u128) <= pos.total_share,
             E_INVALID_AMOUNT
@@ -524,19 +599,130 @@ module fered::loan_position {
         );
 
         pos.total_interest_earned += yield_amount;
+        // Update fee growth global based on fees collected
+        let fee_growth_per_share_a =
+            if (pos.total_share > 0) {
+                math128::mul_div(amount_fee_asset_a as u128, precision(), pos.total_share)
+            } else { 0 };
+        let fee_growth_per_share_b =
+            if (pos.total_share > 0) {
+                math128::mul_div(amount_fee_asset_b as u128, precision(), pos.total_share)
+            } else { 0 };
+        pos.fee_growth_global_a += fee_growth_per_share_a;
+        pos.fee_growth_global_b += fee_growth_per_share_b;
+        // Update deposit slot fee growth debt to current global values
+        deposit_slot::update_fee_growth_debt(
+            deposit_slot,
+            pos.fee_growth_global_a,
+            pos.fee_growth_global_b
+        );
         pos.last_update_ts = timestamp::now_seconds();
 
-        // Emit yield claimed event
-        events::emit_yield_claimed(
-            object::object_address(&position),
-            signer::address_of(owner),
-            object::object_address(&loan_slot),
-            yield_amount,
-            amount_fee_asset_a as u64,
-            amount_fee_asset_b as u64,
-            reward_assets_count as u64,
-            pos.last_update_ts
+        (yield_amount, amount_fee_asset_a, amount_fee_asset_b, reward_assets_count)
+    }
+
+    fun loan_slot_claim_yield_internal(
+        owner: &signer, pos: &mut LoanPosition, loan_slot: Object<LoanSlot>
+    ): (u128, u64, u64, u64) {
+        let admin_signer =
+            account::create_signer_with_capability(&pos.lending_position_cap.signer_cap);
+        let share = loan_slot::share(loan_slot);
+        assert!(
+            share > 0 && share <= pos.total_share,
+            E_INVALID_AMOUNT
         );
+
+        let yield_amount = math128::mul_div(share, pos.liquidity, pos.total_share);
+        assert_valid_amount(yield_amount as u64);
+
+        let (fee_asset_a, fee_asset_b) =
+            pool_v3::claim_fees(&admin_signer, pos.pos_object);
+
+        let rewared_assets = pool_v3::claim_rewards(&admin_signer, pos.pos_object);
+
+        let ratio =
+            if (pos.liquidity > 0) {
+                math128::mul_div(yield_amount as u128, precision(), pos.liquidity)
+            } else { 0 };
+
+        let amount_fee_asset_a = fungible_asset::amount(&fee_asset_a);
+        let amount_fee_asset_b = fungible_asset::amount(&fee_asset_b);
+        let yield_fee_asset_a =
+            math128::mul_div(amount_fee_asset_a as u128, ratio, precision());
+        let yield_fee_asset_b =
+            math128::mul_div(amount_fee_asset_b as u128, ratio, precision());
+
+        // Transfer yield portion to owner, deposit remainder back to admin
+        if (yield_fee_asset_a > 0) {
+            primary_fungible_store::transfer(
+                &admin_signer,
+                fungible_asset::asset_metadata(&fee_asset_a),
+                signer::address_of(owner),
+                yield_fee_asset_a as u64
+            );
+        };
+
+        if (yield_fee_asset_b > 0) {
+            primary_fungible_store::transfer(
+                &admin_signer,
+                fungible_asset::asset_metadata(&fee_asset_b),
+                signer::address_of(owner),
+                yield_fee_asset_b as u64
+            );
+        };
+
+        // Deposit remaining fee assets to admin store
+        primary_fungible_store::deposit(signer::address_of(&admin_signer), fee_asset_a);
+        primary_fungible_store::deposit(signer::address_of(&admin_signer), fee_asset_b);
+
+        // Reward assets transfer
+        let reward_assets_count = rewared_assets.length();
+        rewared_assets.for_each(
+            |asset| {
+                let amount_asset = fungible_asset::amount(&asset);
+                if (amount_asset > 0) {
+                    let yield_amount_asset =
+                        math128::mul_div(amount_asset as u128, ratio, precision()) as u64;
+                    if (yield_amount_asset > 0) {
+                        primary_fungible_store::transfer(
+                            &admin_signer,
+                            fungible_asset::asset_metadata(&asset),
+                            signer::address_of(owner),
+                            yield_amount_asset
+                        );
+                    };
+                };
+                // Deposit remaining reward asset to admin store
+                primary_fungible_store::deposit(signer::address_of(&admin_signer), asset);
+            }
+        );
+
+        pos.total_interest_earned += yield_amount;
+
+        // Update fee growth global based on fees collected
+        let fee_growth_per_share_a =
+            if (pos.total_share > 0) {
+                math128::mul_div(amount_fee_asset_a as u128, precision(), pos.total_share)
+            } else { 0 };
+
+        let fee_growth_per_share_b =
+            if (pos.total_share > 0) {
+                math128::mul_div(amount_fee_asset_b as u128, precision(), pos.total_share)
+            } else { 0 };
+
+        pos.fee_growth_global_a += fee_growth_per_share_a;
+        pos.fee_growth_global_b += fee_growth_per_share_b;
+
+        // Update loan slot fee growth debt to current global values
+        loan_slot::update_fee_growth_debt(
+            loan_slot,
+            pos.fee_growth_global_a,
+            pos.fee_growth_global_b
+        );
+
+        pos.last_update_ts = timestamp::now_seconds();
+
+        (yield_amount, amount_fee_asset_a, amount_fee_asset_b, reward_assets_count)
     }
 
     fun updated_debt_index(
@@ -670,6 +856,25 @@ module fered::loan_position {
     ): (u128, u64, u64, u64) acquires LoanPosition {
         let pos = borrow_loan_position(position);
         (pos.liquidity, pos.utilization, pos.available_borrow, pos.total_borrowed)
+    }
+
+    #[view]
+    public fun get_fee_growth_global(
+        position: Object<LoanPosition>
+    ): (u128, u128) acquires LoanPosition {
+        let pos = borrow_loan_position(position);
+        (pos.fee_growth_global_a, pos.fee_growth_global_b)
+    }
+
+    // === FEE GROWTH MANAGEMENT ===
+
+    public(friend) fun update_fee_growth_global(
+        position: Object<LoanPosition>, fee_growth_a: u128, fee_growth_b: u128
+    ) acquires LoanPosition {
+        let pos = borrow_loan_position_mut(position);
+        pos.fee_growth_global_a += fee_growth_a;
+        pos.fee_growth_global_b += fee_growth_b;
+        pos.last_update_ts = timestamp::now_seconds();
     }
 
     // === HELPER FUNCTIONS ===

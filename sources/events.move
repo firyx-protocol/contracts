@@ -1,11 +1,11 @@
-module fered::events {
+module firyx::events {
     use aptos_framework::event;
     use aptos_framework::object::Object;
     use aptos_framework::fungible_asset::Metadata;
 
-    friend fered::loan_position;
-    friend fered::deposit_slot;
-    friend fered::loan_slot;
+    friend firyx::loan_position;
+    friend firyx::deposit_slot;
+    friend firyx::loan_slot;
 
     // === LOAN POSITION EVENTS ===
 
@@ -120,9 +120,9 @@ module fered::events {
         loan_slot: address,
         borrower: address,
         loan_position: address,
-        principal: u64,
-        original_principal: u64,
-        share: u64,
+        principal: u128,
+        original_principal: u128,
+        share: u128,
         reserve: u64,
         debt_idx_at_borrow: u128,
         timestamp: u64
@@ -135,7 +135,7 @@ module fered::events {
         amount: u64,
         principal_portion: u64,
         interest_portion: u64,
-        remaining_principal: u64,
+        remaining_principal: u128,
         loan_fully_repaid: bool,
         debt_idx: u128,
         timestamp: u64
@@ -149,7 +149,7 @@ module fered::events {
         reserve_withdrawn: u64,
         principal_portion: u64,
         interest_portion: u64,
-        remaining_principal: u64,
+        remaining_principal: u128,
         loan_fully_repaid: bool,
         timestamp: u64
     }
@@ -351,9 +351,9 @@ module fered::events {
         loan_slot: address,
         borrower: address,
         loan_position: address,
-        principal: u64,
-        original_principal: u64,
-        share: u64,
+        principal: u128,
+        original_principal: u128,
+        share: u128,
         reserve: u64,
         debt_idx_at_borrow: u128,
         timestamp: u64
@@ -377,7 +377,7 @@ module fered::events {
         amount: u64,
         principal_portion: u64,
         interest_portion: u64,
-        remaining_principal: u64,
+        remaining_principal: u128,
         loan_fully_repaid: bool,
         debt_idx: u128,
         timestamp: u64
@@ -402,7 +402,7 @@ module fered::events {
         reserve_withdrawn: u64,
         principal_portion: u64,
         interest_portion: u64,
-        remaining_principal: u64,
+        remaining_principal: u128,
         loan_fully_repaid: bool,
         timestamp: u64
     ) {

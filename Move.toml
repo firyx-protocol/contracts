@@ -1,17 +1,17 @@
 [package]
-name = "fered"
+name = "firyx"
 upgrade_policy = "compatible"
 version = "1.0.0"
 authors = []
 
 [addresses]
-fered = "_"
+firyx = "_"
 admin = "0x57c528d90af4255748b37f3730afdda043fad019be735e7d899f5565840e0366"
 deployer = "0xd548f6e8ef91c57e7983b1051df686a3753f3d453d37ef781782450e61079fe9"
 dex_contract = "0x8b4a2c4bb53857c718a04c020b98f8c2e1f99a68b0f57389a8bf5434cd22e05c"
 
 [dev-addresses]
-fered = "0x111"
+firyx = "0x111"
 
 [dependencies.AptosFramework]
 git = "https://github.com/aptos-labs/aptos-framework.git"

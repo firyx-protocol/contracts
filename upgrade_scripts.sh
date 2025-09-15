@@ -1,0 +1,1 @@
+aptos move upgrade-object --profile default --address-name firyx --object-address 0xe6f3d412f70a33dc85f431671afa237db4f9b3602e46aaa8850ba37e8a3cd729 --max-gas 500000 --assume-yes

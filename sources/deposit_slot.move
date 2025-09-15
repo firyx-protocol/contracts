@@ -1,13 +1,13 @@
-module fered::deposit_slot {
+module firyx::deposit_slot {
     use std::signer;
     use aptos_framework::object::{Self, Object};
     use aptos_framework::timestamp;
     use aptos_framework::math128;
     use aptos_framework::error;
-    use fered::math::{bps};
-    use fered::events;
+    use firyx::math::{bps};
+    use firyx::events;
 
-    friend fered::loan_position;
+    friend firyx::loan_position;
 
     // === CONSTANTS ===
     const PRECISION: u128 = 1_000_000_000_000;
@@ -34,7 +34,9 @@ module fered::deposit_slot {
         lender: address,
         original_principal: u128,      // Original deposit amount
         accumulated_deposits: u128,    // Total amount deposited
-        shares: u64,                  // Shares ownership trong pool
+        fee_growth_debt_a: u128,
+        fee_growth_debt_b: u128,
+        share: u64,                  // Shares ownership trong pool
         created_at_ts: u64,
         active: bool,
         last_deposit_ts: u64,
@@ -75,7 +77,9 @@ module fered::deposit_slot {
             lender: signer::address_of(lender),
             original_principal: principal,
             accumulated_deposits: principal,
-            shares,
+            fee_growth_debt_a: 0,
+            fee_growth_debt_b: 0,
+            share: shares,
             created_at_ts: ts,
             active: true,
             last_deposit_ts: ts,
@@ -88,7 +92,7 @@ module fered::deposit_slot {
 
         move_to(&container_signer, deposit_info);
 
-        let state = borrow_global_mut<GlobalState>(@fered);
+        let state = borrow_global_mut<GlobalState>(@firyx);
         state.total_deposits += 1;
         state.active_deposits += 1;
 
@@ -149,7 +153,7 @@ module fered::deposit_slot {
 
         // Update deposit info
         deposit_slot.accumulated_deposits += amount;
-        deposit_slot.shares += new_shares;
+        deposit_slot.share += new_shares;
         deposit_slot.last_deposit_ts = timestamp::now_seconds();
 
         // Calculate position percentage in the pool (in basis points)
@@ -157,7 +161,7 @@ module fered::deposit_slot {
         let position_percentage =
             if (new_total_shares > 0) {
                 math128::mul_div(
-                    deposit_slot.shares as u128,
+                    deposit_slot.share as u128,
                     bps() as u128,
                     new_total_shares as u128
                 ) as u64
@@ -171,14 +175,14 @@ module fered::deposit_slot {
             signer::address_of(lender),
             amount,
             new_shares,
-            deposit_slot.shares,
+            deposit_slot.share,
             deposit_slot.accumulated_deposits,
             position_percentage,
             is_new_deposit,
             deposit_slot.last_deposit_ts
         );
 
-        (new_shares, deposit_slot.shares, position_percentage, is_new_deposit)
+        (new_shares, deposit_slot.share, position_percentage, is_new_deposit)
     }
 
     /// Withdraw liquidity based on amount
@@ -218,7 +222,7 @@ module fered::deposit_slot {
         assert_sufficient_shares(deposit_slot, shares_to_burn);
 
         // Update deposit info based on shares burned, not amount
-        deposit_slot.shares -= shares_to_burn;
+        deposit_slot.share -= shares_to_burn;
         let withdrawal_value = if (total_pool_shares > 0) {
             math128::mul_div(
                 shares_to_burn as u128,
@@ -233,13 +237,13 @@ module fered::deposit_slot {
             } else { 0 };
         deposit_slot.last_withdraw_ts = timestamp::now_seconds();
 
-        let fully_withdrawn = deposit_slot.shares == 0;
+        let fully_withdrawn = deposit_slot.share == 0;
 
         // If fully withdrawn, mark as inactive
         if (fully_withdrawn) {
             deposit_slot.active = false;
             // Update global state
-            let state = borrow_global_mut<GlobalState>(@fered);
+            let state = borrow_global_mut<GlobalState>(@firyx);
             state.active_deposits -= 1;
         };
 
@@ -248,7 +252,7 @@ module fered::deposit_slot {
         let position_percentage =
             if (new_total_shares > 0 && !fully_withdrawn) {
                 math128::mul_div(
-                    deposit_slot.shares as u128,
+                    deposit_slot.share as u128,
                     bps() as u128,
                     new_total_shares as u128
                 ) as u64
@@ -260,14 +264,14 @@ module fered::deposit_slot {
             signer::address_of(lender),
             amount,
             shares_to_burn,
-            deposit_slot.shares,
+            deposit_slot.share,
             deposit_slot.accumulated_deposits,
             position_percentage,
             fully_withdrawn,
             deposit_slot.last_withdraw_ts
         );
 
-        (shares_to_burn, deposit_slot.shares, position_percentage, fully_withdrawn)
+        (shares_to_burn, deposit_slot.share, position_percentage, fully_withdrawn)
     }
 
     // === ASSERT FUNCTIONS ===
@@ -288,7 +292,7 @@ module fered::deposit_slot {
     }
 
     fun assert_sufficient_shares(deposit_slot: &DepositSlot, required_shares: u64) {
-        assert!(required_shares <= deposit_slot.shares, E_INSUFFICIENT_BALANCE);
+        assert!(required_shares <= deposit_slot.share, E_INSUFFICIENT_BALANCE);
     }
 
     fun assert_non_zero_principal(principal: u128) {
@@ -310,8 +314,8 @@ module fered::deposit_slot {
         borrow_deposit_slot(deposit_slot_obj).accumulated_deposits
     }
 
-    public fun shares(deposit_slot_obj: Object<DepositSlot>): u64 acquires DepositSlot {
-        borrow_deposit_slot(deposit_slot_obj).shares
+    public fun share(deposit_slot_obj: Object<DepositSlot>): u64 acquires DepositSlot {
+        borrow_deposit_slot(deposit_slot_obj).share
     }
 
     public fun timestamp_created(
@@ -349,13 +353,21 @@ module fered::deposit_slot {
         borrow_deposit_slot(deposit_slot_obj).loan_pos_addr
     }
 
+    public fun fee_growth_debt_a(deposit_slot_obj: Object<DepositSlot>): u128 acquires DepositSlot {
+        borrow_deposit_slot(deposit_slot_obj).fee_growth_debt_a
+    }
+
+    public fun fee_growth_debt_b(deposit_slot_obj: Object<DepositSlot>): u128 acquires DepositSlot {
+        borrow_deposit_slot(deposit_slot_obj).fee_growth_debt_b
+    }
+
     // Global state view
     public fun total_deposits(): u64 acquires GlobalState {
-        borrow_global<GlobalState>(@fered).total_deposits
+        borrow_global<GlobalState>(@firyx).total_deposits
     }
 
     public fun active_deposits(): u64 acquires GlobalState {
-        borrow_global<GlobalState>(@fered).active_deposits
+        borrow_global<GlobalState>(@firyx).active_deposits
     }
 
     // Calculate current withdrawal value based on pool state
@@ -370,13 +382,51 @@ module fered::deposit_slot {
             return deposit_slot.accumulated_deposits
         } else if (total_pool_shares > 0 && total_pool_liquidity > 0) {
             return math128::mul_div(
-                deposit_slot.shares as u128,
+                deposit_slot.share as u128,
                 total_pool_liquidity,
                 total_pool_shares as u128
             )
         } else {
             return 0
         }
+    }
+
+    // === FRIEND FUNCTIONS FOR FEE GROWTH TRACKING ===
+
+    public(friend) fun update_fee_growth_debt(
+        ds_obj: Object<DepositSlot>, 
+        fee_growth_global_a: u128, 
+        fee_growth_global_b: u128
+    ) acquires DepositSlot {
+        let deposit_slot = borrow_deposit_slot_mut(ds_obj);
+        deposit_slot.fee_growth_debt_a = fee_growth_global_a;
+        deposit_slot.fee_growth_debt_b = fee_growth_global_b;
+    }
+
+    public(friend) fun calculate_pending_yield(
+        ds_obj: Object<DepositSlot>,
+        fee_growth_global_a: u128,
+        fee_growth_global_b: u128
+    ): (u128, u128) acquires DepositSlot {
+        let deposit_slot = borrow_deposit_slot(ds_obj);
+        
+        let pending_yield_a = if (fee_growth_global_a >= deposit_slot.fee_growth_debt_a) {
+            math128::mul_div(
+                deposit_slot.share as u128,
+                fee_growth_global_a - deposit_slot.fee_growth_debt_a,
+                PRECISION
+            )
+        } else { 0 };
+
+        let pending_yield_b = if (fee_growth_global_b >= deposit_slot.fee_growth_debt_b) {
+            math128::mul_div(
+                deposit_slot.share as u128,
+                fee_growth_global_b - deposit_slot.fee_growth_debt_b,
+                PRECISION
+            )
+        } else { 0 };
+
+        (pending_yield_a, pending_yield_b)
     }
 
     // === HELPER FUNCTIONS ===
@@ -401,11 +451,11 @@ module fered::deposit_slot {
         init_module(deployer);
     }
 
-    #[test(fered = @fered, aptos_framework = @0x1, lender = @0x123)]
+    #[test(firyx = @firyx, aptos_framework = @0x1, lender = @0x123)]
     fun test_create_deposit_slot_basic(
-        fered: &signer, aptos_framework: &signer, lender: &signer
+        firyx: &signer, aptos_framework: &signer, lender: &signer
     ) acquires DepositSlot, GlobalState {
-        init_for_test(fered, aptos_framework);
+        init_for_test(firyx, aptos_framework);
 
         let loan_pos_addr = @0x456;
         let principal = 1000u128;
@@ -421,11 +471,11 @@ module fered::deposit_slot {
         assert!(total_deposits() == 1, 5);
     }
 
-    #[test(fered = @fered, aptos_framework = @0x1, lender = @0x123)]
+    #[test(firyx = @firyx, aptos_framework = @0x1, lender = @0x123)]
     fun test_deposit_first_in_pool(
-        fered: &signer, aptos_framework: &signer, lender: &signer
+        firyx: &signer, aptos_framework: &signer, lender: &signer
     ) acquires DepositSlot, GlobalState {
-        init_for_test(fered, aptos_framework);
+        init_for_test(firyx, aptos_framework);
 
         let deposit_obj = create_deposit_slot(lender, @0x456, 0, 0);
         let amount = 1000u128;
@@ -448,11 +498,11 @@ module fered::deposit_slot {
         assert!(position_pct == bps(), 5); // 100%
     }
 
-    #[test(fered = @fered, aptos_framework = @0x1, lender = @0x123)]
+    #[test(firyx = @firyx, aptos_framework = @0x1, lender = @0x123)]
     fun test_deposit_additional_liquidity(
-        fered: &signer, aptos_framework: &signer, lender: &signer
+        firyx: &signer, aptos_framework: &signer, lender: &signer
     ) acquires DepositSlot, GlobalState {
-        init_for_test(fered, aptos_framework);
+        init_for_test(firyx, aptos_framework);
 
         let deposit_obj = create_deposit_slot(lender, @0x456, 1000, 1000);
         let additional_amount = 500u128;
@@ -476,11 +526,11 @@ module fered::deposit_slot {
         assert!(position_pct > 0, 5);
     }
 
-    #[test(fered = @fered, aptos_framework = @0x1, lender = @0x123)]
+    #[test(firyx = @firyx, aptos_framework = @0x1, lender = @0x123)]
     fun test_withdraw_partial(
-        fered: &signer, aptos_framework: &signer, lender: &signer
+        firyx: &signer, aptos_framework: &signer, lender: &signer
     ) acquires DepositSlot, GlobalState {
-        init_for_test(fered, aptos_framework);
+        init_for_test(firyx, aptos_framework);
 
         let deposit_obj = create_deposit_slot(lender, @0x456, 1000, 1000);
         let withdraw_amount = 300u128;
@@ -503,11 +553,11 @@ module fered::deposit_slot {
         assert!(is_active(deposit_obj), 4);
     }
 
-    #[test(fered = @fered, aptos_framework = @0x1, lender = @0x123)]
+    #[test(firyx = @firyx, aptos_framework = @0x1, lender = @0x123)]
     fun test_withdraw_full(
-        fered: &signer, aptos_framework: &signer, lender: &signer
+        firyx: &signer, aptos_framework: &signer, lender: &signer
     ) acquires DepositSlot, GlobalState {
-        init_for_test(fered, aptos_framework);
+        init_for_test(firyx, aptos_framework);
 
         let deposit_obj = create_deposit_slot(lender, @0x456, 1000, 1000);
         let total_pool_liquidity = 1000u128;
@@ -529,11 +579,11 @@ module fered::deposit_slot {
         assert!(position_pct == 0, 5);
     }
 
-    #[test(fered = @fered, aptos_framework = @0x1, lender = @0x123)]
+    #[test(firyx = @firyx, aptos_framework = @0x1, lender = @0x123)]
     fun test_current_withdrawal_value(
-        fered: &signer, aptos_framework: &signer, lender: &signer
+        firyx: &signer, aptos_framework: &signer, lender: &signer
     ) acquires DepositSlot, GlobalState {
-        init_for_test(fered, aptos_framework);
+        init_for_test(firyx, aptos_framework);
 
         let deposit_obj = create_deposit_slot(lender, @0x456, 1000, 1000);
 

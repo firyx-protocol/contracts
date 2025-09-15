@@ -1,10 +1,10 @@
-module fered::math {
+module firyx::math {
     use aptos_framework::math64;
 
-    // friend fered::core;
-    friend fered::loan_slot;
-    friend fered::deposit_slot;
-    friend fered::loan_position;
+    // friend firyx::core;
+    friend firyx::loan_slot;
+    friend firyx::deposit_slot;
+    friend firyx::loan_position;
 
     /// ===== ERROR CODES =====
     const E_DIVISION_BY_ZERO: u64 = 1;
