@@ -32,8 +32,8 @@ module firyx::loan_slot {
     // === STRUCTS ===
     struct LoanSlot has key {
         loan_pos_addr: address,
-        principal: u128,              // Current remaining principal
-        original_principal: u128,     // Original principal for accurate debt calculation
+        principal: u128, // Current remaining principal
+        original_principal: u128, // Original principal for accurate debt calculation
         share: u128,
         reserve: u64,
         debt_idx_at_borrow: u128,
@@ -64,16 +64,16 @@ module firyx::loan_slot {
         principal: u128,
         share: u128,
         reserve: u64,
-        debt_idx_at_borrow: u128,
+        debt_idx_at_borrow: u128
     ): Object<LoanSlot> {
         assert_valid_amounts(principal, share, reserve);
         assert_valid_debt_index(debt_idx_at_borrow);
-        
+
         let ts = timestamp::now_seconds();
         let borrow_info = LoanSlot {
             loan_pos_addr,
             principal,
-            original_principal: principal,  // Store original principal
+            original_principal: principal, // Store original principal
             share,
             reserve,
             debt_idx_at_borrow,
@@ -87,14 +87,15 @@ module firyx::loan_slot {
             last_payment_ts: ts,
             arrears_start_ts: option::none<u64>()
         };
-        
+
         let borrower_addr = signer::address_of(borrower);
         let constructor_ref = object::create_object(borrower_addr);
         let container_signer = object::generate_signer(&constructor_ref);
 
         move_to(&container_signer, borrow_info);
 
-        let loan_slot_obj = object::object_from_constructor_ref<LoanSlot>(&constructor_ref);
+        let loan_slot_obj =
+            object::object_from_constructor_ref<LoanSlot>(&constructor_ref);
         object::transfer(borrower, loan_slot_obj, borrower_addr);
 
         // Emit event
@@ -122,7 +123,7 @@ module firyx::loan_slot {
         assert_is_owner(borrower, ls_obj);
         assert_valid_debt_index(current_debt_idx);
         assert_non_zero_amount(amount);
-        
+
         // Check active status BEFORE calling repay
         let loan_slot = borrow_loan_slot_mut(ls_obj);
         assert_is_active(loan_slot);
@@ -132,21 +133,22 @@ module firyx::loan_slot {
 
         // Re-borrow after repay since repay might have modified state
         let loan_slot = borrow_loan_slot_mut(ls_obj);
-        
+
         // Only check principal_portion if loan is still active
         if (!loan_repaid) {
             assert_non_zero_principal(principal_portion as u128);
         };
 
         // Calculate reserve proportional to original principal
-        let reserve_to_withdraw = math128::mul_div(
-            loan_slot.reserve as u128,
-            principal_portion as u128,
-            loan_slot.original_principal
-        ) as u64;
+        let reserve_to_withdraw =
+            math128::mul_div(
+                loan_slot.reserve as u128,
+                principal_portion as u128,
+                loan_slot.original_principal
+            ) as u64;
 
         loan_slot.withdrawn_amount += reserve_to_withdraw;
-        loan_slot.available_withdraw = 
+        loan_slot.available_withdraw =
             if (loan_slot.available_withdraw >= reserve_to_withdraw) {
                 loan_slot.available_withdraw - reserve_to_withdraw
             } else { 0 };
@@ -183,34 +185,36 @@ module firyx::loan_slot {
         };
 
         // Use original_principal for debt calculation consistency
-        let principal_scaled = math128::mul_div(
-            loan_slot.original_principal,
-            current_debt_idx,
-            loan_slot.debt_idx_at_borrow
-        );
-        
+        let principal_scaled =
+            math128::mul_div(
+                loan_slot.original_principal,
+                current_debt_idx,
+                loan_slot.debt_idx_at_borrow
+            );
+
         let amount_u128 = amount as u128;
         // Correct logic for principal vs interest calculation
-        let (principal_portion, interest_portion) = if (amount_u128 >= principal_scaled) {
-            // Full repayment: pay all remaining principal + interest
-            let interest = (principal_scaled - loan_slot.principal) as u64;
-            (loan_slot.principal as u64, interest)
-        } else {
-            // Partial repayment: calculate how much goes to principal vs interest
-            let principal_portion = math128::mul_div(
-                amount_u128,
-                loan_slot.debt_idx_at_borrow,
-                current_debt_idx
-            ) as u64;
-            let interest_portion = amount - principal_portion;
-            (principal_portion, interest_portion)
-        };
+        let (principal_portion, interest_portion) =
+            if (amount_u128 >= principal_scaled) {
+                // Full repayment: pay all remaining principal + interest
+                let interest = (principal_scaled - loan_slot.principal) as u64;
+                (loan_slot.principal as u64, interest)
+            } else {
+                // Partial repayment: calculate how much goes to principal vs interest
+                let principal_portion =
+                    math128::mul_div(
+                        amount_u128,
+                        loan_slot.debt_idx_at_borrow,
+                        current_debt_idx
+                    ) as u64;
+                let interest_portion = amount - principal_portion;
+                (principal_portion, interest_portion)
+            };
 
-        loan_slot.principal = if (loan_slot.principal >= (principal_portion as u128)) {
-            loan_slot.principal - (principal_portion as u128)
-        } else {
-            0
-        };
+        loan_slot.principal =
+            if (loan_slot.principal >= (principal_portion as u128)) {
+                loan_slot.principal - (principal_portion as u128)
+            } else { 0 };
         loan_slot.last_payment_ts = timestamp::now_seconds();
         let loan_repaid = loan_slot.principal == 0;
 
@@ -269,47 +273,52 @@ module firyx::loan_slot {
         assert!(principal > 0, E_ZERO_PRINCIPAL);
     }
 
-    fun assert_sufficient_reserve(loan_slot: &LoanSlot, required_amount: u64) {
+    fun assert_sufficient_reserve(
+        loan_slot: &LoanSlot, required_amount: u64
+    ) {
         assert!(loan_slot.reserve >= required_amount, E_INSUFFICIENT_RESERVE);
     }
 
     // === SET FUNCTIONS ===
-    public(friend) fun set_principal(ls_obj: Object<LoanSlot>, new_principal: u128) 
-        acquires LoanSlot {
+    public(friend) fun set_principal(
+        ls_obj: Object<LoanSlot>, new_principal: u128
+    ) acquires LoanSlot {
         let loan_slot = borrow_loan_slot_mut(ls_obj);
         loan_slot.principal = new_principal;
     }
 
-    public(friend) fun set_share(ls_obj: Object<LoanSlot>, new_share: u128) 
-        acquires LoanSlot {
+    public(friend) fun set_share(
+        ls_obj: Object<LoanSlot>, new_share: u128
+    ) acquires LoanSlot {
         assert!(new_share > 0, E_ZERO_AMOUNT);
         let loan_slot = borrow_loan_slot_mut(ls_obj);
         loan_slot.share = new_share;
     }
 
-    public(friend) fun set_reserve(ls_obj: Object<LoanSlot>, new_reserve: u64) 
-        acquires LoanSlot {
+    public(friend) fun set_reserve(
+        ls_obj: Object<LoanSlot>, new_reserve: u64
+    ) acquires LoanSlot {
         let loan_slot = borrow_loan_slot_mut(ls_obj);
         loan_slot.reserve = new_reserve;
     }
 
-    public(friend) fun set_debt_idx_at_borrow(ls_obj: Object<LoanSlot>, new_debt_idx: u128) 
-        acquires LoanSlot {
+    public(friend) fun set_debt_idx_at_borrow(
+        ls_obj: Object<LoanSlot>, new_debt_idx: u128
+    ) acquires LoanSlot {
         assert_valid_debt_index(new_debt_idx);
         let loan_slot = borrow_loan_slot_mut(ls_obj);
         loan_slot.debt_idx_at_borrow = new_debt_idx;
     }
 
-    public(friend) fun set_active_status(ls_obj: Object<LoanSlot>, is_active: bool) 
-        acquires LoanSlot {
+    public(friend) fun set_active_status(
+        ls_obj: Object<LoanSlot>, is_active: bool
+    ) acquires LoanSlot {
         let loan_slot = borrow_loan_slot_mut(ls_obj);
         loan_slot.active = is_active;
     }
 
     public(friend) fun update_fee_growth_debt(
-        ls_obj: Object<LoanSlot>, 
-        fee_growth_global_a: u128, 
-        fee_growth_global_b: u128
+        ls_obj: Object<LoanSlot>, fee_growth_global_a: u128, fee_growth_global_b: u128
     ) acquires LoanSlot {
         let loan_slot = borrow_loan_slot_mut(ls_obj);
         loan_slot.fee_growth_debt_a = fee_growth_global_a;
@@ -317,66 +326,119 @@ module firyx::loan_slot {
     }
 
     public(friend) fun calculate_pending_yield(
-        ls_obj: Object<LoanSlot>,
-        fee_growth_global_a: u128,
-        fee_growth_global_b: u128
+        ls_obj: Object<LoanSlot>, fee_growth_global_a: u128, fee_growth_global_b: u128
     ): (u128, u128) acquires LoanSlot {
         let loan_slot = borrow_loan_slot(ls_obj);
-        
-        let pending_yield_a = if (fee_growth_global_a >= loan_slot.fee_growth_debt_a) {
-            math128::mul_div(
-                loan_slot.share,
-                fee_growth_global_a - loan_slot.fee_growth_debt_a,
-                PRECISION
-            )
-        } else { 0 };
 
-        let pending_yield_b = if (fee_growth_global_b >= loan_slot.fee_growth_debt_b) {
-            math128::mul_div(
-                loan_slot.share,
-                fee_growth_global_b - loan_slot.fee_growth_debt_b,
-                PRECISION
-            )
-        } else { 0 };
+        let pending_yield_a =
+            if (fee_growth_global_a >= loan_slot.fee_growth_debt_a) {
+                math128::mul_div(
+                    loan_slot.share,
+                    fee_growth_global_a - loan_slot.fee_growth_debt_a,
+                    PRECISION
+                )
+            } else { 0 };
+
+        let pending_yield_b =
+            if (fee_growth_global_b >= loan_slot.fee_growth_debt_b) {
+                math128::mul_div(
+                    loan_slot.share,
+                    fee_growth_global_b - loan_slot.fee_growth_debt_b,
+                    PRECISION
+                )
+            } else { 0 };
 
         (pending_yield_a, pending_yield_b)
     }
 
     // === VIEW FUNCTIONS ===
+    #[view]
+    public fun get_loan_slot_info(
+        loan_slot_obj: Object<LoanSlot>
+    ): (
+        address, // loan_pos_addr
+        u128, // principal
+        u128, // original_principal
+        u128, // share
+        u64, // reserve
+        u128, // debt_idx_at_borrow
+        u128, // fee_growth_debt_a
+        u128, // fee_growth_debt_b
+        bool, // active
+        u64, // created_at_ts
+        u64, // withdrawn_amount
+        u64, // available_withdraw
+        u64, // last_payment_ts
+        Option<u64> // arrears_start_ts
+    ) acquires LoanSlot {
+        let loan_slot = borrow_loan_slot(loan_slot_obj);
+        (
+            loan_slot.loan_pos_addr,
+            loan_slot.principal,
+            loan_slot.original_principal,
+            loan_slot.share,
+            loan_slot.reserve,
+            loan_slot.debt_idx_at_borrow,
+            loan_slot.fee_growth_debt_a,
+            loan_slot.fee_growth_debt_b,
+            loan_slot.active,
+            loan_slot.created_at_ts,
+            loan_slot.withdrawn_amount,
+            loan_slot.available_withdraw,
+            loan_slot.last_payment_ts,
+            loan_slot.arrears_start_ts
+        )
+    }
+
+    #[view]
     public fun principal(loan_slot_obj: Object<LoanSlot>): u128 acquires LoanSlot {
         borrow_loan_slot(loan_slot_obj).principal
     }
 
+    #[view]
     public fun original_principal(loan_slot_obj: Object<LoanSlot>): u128 acquires LoanSlot {
         borrow_loan_slot(loan_slot_obj).original_principal
     }
 
+    #[view]
     public fun share(loan_slot_obj: Object<LoanSlot>): u128 acquires LoanSlot {
         borrow_loan_slot(loan_slot_obj).share
     }
 
+    #[view]
     public fun reserve(loan_slot_obj: Object<LoanSlot>): u64 acquires LoanSlot {
         borrow_loan_slot(loan_slot_obj).reserve
     }
 
+
+    #[view]
     public fun debt_idx_at_borrow(loan_slot_obj: Object<LoanSlot>): u128 acquires LoanSlot {
         borrow_loan_slot(loan_slot_obj).debt_idx_at_borrow
     }
 
+
+    #[view]
     public fun fee_growth_debt_a(loan_slot_obj: Object<LoanSlot>): u128 acquires LoanSlot {
         borrow_loan_slot(loan_slot_obj).fee_growth_debt_a
     }
 
+
+    #[view]
     public fun fee_growth_debt_b(loan_slot_obj: Object<LoanSlot>): u128 acquires LoanSlot {
         borrow_loan_slot(loan_slot_obj).fee_growth_debt_b
     }
 
+
+    #[view]
     public fun is_active(loan_slot_obj: Object<LoanSlot>): bool acquires LoanSlot {
         borrow_loan_slot(loan_slot_obj).active
     }
 
-    public fun current_debt(loan_slot_obj: Object<LoanSlot>, current_debt_idx: u128): u128 
-        acquires LoanSlot {
+
+    #[view]
+    public fun current_debt(
+        loan_slot_obj: Object<LoanSlot>, current_debt_idx: u128
+    ): u128 acquires LoanSlot {
         let loan_slot = borrow_loan_slot(loan_slot_obj);
         // Use original_principal for accurate debt calculation
         math128::mul_div(
@@ -399,3 +461,4 @@ module firyx::loan_slot {
         borrow_global_mut<LoanSlot>(addr)
     }
 }
+

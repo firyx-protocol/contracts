@@ -104,6 +104,22 @@ module firyx::loan_position {
         total_share: u128
     }
 
+    // Registry lưu toàn bộ loan position address và các thông số tổng hợp
+    struct LoanPositionRegistry has key {
+        positions: vector<address>,
+        total_liquidity: u128,
+        total_active_loans: u64
+    }
+
+    // Hàm khởi tạo registry, gọi khi deploy hoặc test
+    public fun init_registry(admin: &signer) {
+        move_to(admin, LoanPositionRegistry {
+            positions: vector::empty<address>(),
+            total_liquidity: 0,
+            total_active_loans: 0
+        });
+    }
+
     public entry fun create_loan_position(
         creator: &signer,
         token_a: Object<Metadata>,
@@ -853,9 +869,52 @@ module firyx::loan_position {
     #[view]
     public fun get_position_info(
         position: Object<LoanPosition>
-    ): (u128, u64, u64, u64) acquires LoanPosition {
+    ): (
+        // Basic info
+        u128, // liquidity
+        u64, // utilization
+        u64, // available_borrow
+        u64, // total_borrowed
+        u128, // current_debt_idx
+        u128, // total_share
+
+        // Status
+        bool, // active
+        u64, // created_at_ts
+        u64, // last_update_ts
+        u64, // active_loans_count
+        u128, // total_interest_earned
+
+        // Parameters
+        u8, // fee_tier
+        u32, // tick_lower
+        u32, // tick_upper
+        u64, // slope_before_kink
+        u64, // slope_after_kink
+        u64, // kink_utilization
+        u8 // risk_factor
+    ) acquires LoanPosition {
         let pos = borrow_loan_position(position);
-        (pos.liquidity, pos.utilization, pos.available_borrow, pos.total_borrowed)
+        (
+            pos.liquidity,
+            pos.utilization,
+            pos.available_borrow,
+            pos.total_borrowed,
+            pos.current_debt_idx,
+            pos.total_share,
+            pos.active,
+            pos.created_at_ts,
+            pos.last_update_ts,
+            pos.active_loans_count,
+            pos.total_interest_earned,
+            pos.parameters.fee_tier,
+            pos.parameters.tick_lower,
+            pos.parameters.tick_upper,
+            pos.parameters.slope_before_kink,
+            pos.parameters.slope_after_kink,
+            pos.parameters.kink_utilization,
+            pos.parameters.risk_factor
+        )
     }
 
     #[view]

@@ -32,11 +32,11 @@ module firyx::deposit_slot {
     struct DepositSlot has key {
         loan_pos_addr: address,
         lender: address,
-        original_principal: u128,      // Original deposit amount
-        accumulated_deposits: u128,    // Total amount deposited
+        original_principal: u128, // Original deposit amount
+        accumulated_deposits: u128, // Total amount deposited
         fee_growth_debt_a: u128,
         fee_growth_debt_b: u128,
-        share: u64,                  // Shares ownership trong pool
+        share: u64, // Shares ownership trong pool
         created_at_ts: u64,
         active: bool,
         last_deposit_ts: u64,
@@ -50,10 +50,10 @@ module firyx::deposit_slot {
 
     // === INIT ===
     fun init_module(deployer: &signer) {
-        move_to(deployer, GlobalState { 
-            total_deposits: 0,
-            active_deposits: 0 
-        });
+        move_to(
+            deployer,
+            GlobalState { total_deposits: 0, active_deposits: 0 }
+        );
     }
 
     // === CORE FUNCTIONS ===
@@ -223,15 +223,16 @@ module firyx::deposit_slot {
 
         // Update deposit info based on shares burned, not amount
         deposit_slot.share -= shares_to_burn;
-        let withdrawal_value = if (total_pool_shares > 0) {
-            math128::mul_div(
-                shares_to_burn as u128,
-                total_pool_liquidity,
-                total_pool_shares as u128
-            )
-        } else { amount };
-        
-        deposit_slot.accumulated_deposits = 
+        let withdrawal_value =
+            if (total_pool_shares > 0) {
+                math128::mul_div(
+                    shares_to_burn as u128,
+                    total_pool_liquidity,
+                    total_pool_shares as u128
+                )
+            } else { amount };
+
+        deposit_slot.accumulated_deposits =
             if (deposit_slot.accumulated_deposits >= withdrawal_value) {
                 deposit_slot.accumulated_deposits - withdrawal_value
             } else { 0 };
@@ -291,7 +292,9 @@ module firyx::deposit_slot {
         assert!(amount > 0, E_INVALID_AMOUNT);
     }
 
-    fun assert_sufficient_shares(deposit_slot: &DepositSlot, required_shares: u64) {
+    fun assert_sufficient_shares(
+        deposit_slot: &DepositSlot, required_shares: u64
+    ) {
         assert!(required_shares <= deposit_slot.share, E_INSUFFICIENT_BALANCE);
     }
 
@@ -304,32 +307,69 @@ module firyx::deposit_slot {
     }
 
     // === VIEW FUNCTIONS ===
+    #[view]
+    public fun get_deposit_slot_info(
+        ds_obj: Object<DepositSlot>
+    ): (
+        address, // loan_pos_addr
+        address, // lender
+        u128, // original_principal
+        u128, // accumulated_deposits
+        u64, // share
+        u64, // created_at_ts
+        bool, // active
+        u64, // last_deposit_ts
+        u64, // last_withdraw_ts
+        u128, // fee_growth_debt_a
+        u128 // fee_growth_debt_b
+    ) acquires DepositSlot {
+        let deposit_slot = borrow_deposit_slot(ds_obj);
+        (
+            deposit_slot.loan_pos_addr,
+            deposit_slot.lender,
+            deposit_slot.original_principal,
+            deposit_slot.accumulated_deposits,
+            deposit_slot.share,
+            deposit_slot.created_at_ts,
+            deposit_slot.active,
+            deposit_slot.last_deposit_ts,
+            deposit_slot.last_withdraw_ts,
+            deposit_slot.fee_growth_debt_a,
+            deposit_slot.fee_growth_debt_b
+        )
+    }
 
     // Basic deposit slot information
+    #[view]
     public fun original_principal(deposit_slot_obj: Object<DepositSlot>): u128 acquires DepositSlot {
         borrow_deposit_slot(deposit_slot_obj).original_principal
     }
 
-    public fun accumulated_deposits(deposit_slot_obj: Object<DepositSlot>): u128 acquires DepositSlot {
+    #[view]
+    public fun accumulated_deposits(
+        deposit_slot_obj: Object<DepositSlot>
+    ): u128 acquires DepositSlot {
         borrow_deposit_slot(deposit_slot_obj).accumulated_deposits
     }
 
+    #[view]
     public fun share(deposit_slot_obj: Object<DepositSlot>): u64 acquires DepositSlot {
         borrow_deposit_slot(deposit_slot_obj).share
     }
 
-    public fun timestamp_created(
-        deposit_slot_obj: Object<DepositSlot>
-    ): u64 acquires DepositSlot {
+    #[view]
+    public fun timestamp_created(deposit_slot_obj: Object<DepositSlot>): u64 acquires DepositSlot {
         borrow_deposit_slot(deposit_slot_obj).created_at_ts
     }
 
+    #[view]
     public fun last_deposit_timestamp(
         deposit_slot_obj: Object<DepositSlot>
     ): u64 acquires DepositSlot {
         borrow_deposit_slot(deposit_slot_obj).last_deposit_ts
     }
 
+    #[view]
     public fun last_withdraw_timestamp(
         deposit_slot_obj: Object<DepositSlot>
     ): u64 acquires DepositSlot {
@@ -337,35 +377,40 @@ module firyx::deposit_slot {
     }
 
     // Status functions
+    #[view]
     public fun is_active(deposit_slot_obj: Object<DepositSlot>): bool acquires DepositSlot {
         borrow_deposit_slot(deposit_slot_obj).active
     }
 
-    public fun lender_address(
-        deposit_slot_obj: Object<DepositSlot>
-    ): address acquires DepositSlot {
+    #[view]
+    public fun lender_address(deposit_slot_obj: Object<DepositSlot>): address acquires DepositSlot {
         borrow_deposit_slot(deposit_slot_obj).lender
     }
 
+    #[view]
     public fun loan_position_address(
         deposit_slot_obj: Object<DepositSlot>
     ): address acquires DepositSlot {
         borrow_deposit_slot(deposit_slot_obj).loan_pos_addr
     }
 
+    #[view]
     public fun fee_growth_debt_a(deposit_slot_obj: Object<DepositSlot>): u128 acquires DepositSlot {
         borrow_deposit_slot(deposit_slot_obj).fee_growth_debt_a
     }
 
+    #[view]
     public fun fee_growth_debt_b(deposit_slot_obj: Object<DepositSlot>): u128 acquires DepositSlot {
         borrow_deposit_slot(deposit_slot_obj).fee_growth_debt_b
     }
 
     // Global state view
+    #[view]
     public fun total_deposits(): u64 acquires GlobalState {
         borrow_global<GlobalState>(@firyx).total_deposits
     }
 
+    #[view]
     public fun active_deposits(): u64 acquires GlobalState {
         borrow_global<GlobalState>(@firyx).active_deposits
     }
@@ -394,9 +439,7 @@ module firyx::deposit_slot {
     // === FRIEND FUNCTIONS FOR FEE GROWTH TRACKING ===
 
     public(friend) fun update_fee_growth_debt(
-        ds_obj: Object<DepositSlot>, 
-        fee_growth_global_a: u128, 
-        fee_growth_global_b: u128
+        ds_obj: Object<DepositSlot>, fee_growth_global_a: u128, fee_growth_global_b: u128
     ) acquires DepositSlot {
         let deposit_slot = borrow_deposit_slot_mut(ds_obj);
         deposit_slot.fee_growth_debt_a = fee_growth_global_a;
@@ -404,27 +447,27 @@ module firyx::deposit_slot {
     }
 
     public(friend) fun calculate_pending_yield(
-        ds_obj: Object<DepositSlot>,
-        fee_growth_global_a: u128,
-        fee_growth_global_b: u128
+        ds_obj: Object<DepositSlot>, fee_growth_global_a: u128, fee_growth_global_b: u128
     ): (u128, u128) acquires DepositSlot {
         let deposit_slot = borrow_deposit_slot(ds_obj);
-        
-        let pending_yield_a = if (fee_growth_global_a >= deposit_slot.fee_growth_debt_a) {
-            math128::mul_div(
-                deposit_slot.share as u128,
-                fee_growth_global_a - deposit_slot.fee_growth_debt_a,
-                PRECISION
-            )
-        } else { 0 };
 
-        let pending_yield_b = if (fee_growth_global_b >= deposit_slot.fee_growth_debt_b) {
-            math128::mul_div(
-                deposit_slot.share as u128,
-                fee_growth_global_b - deposit_slot.fee_growth_debt_b,
-                PRECISION
-            )
-        } else { 0 };
+        let pending_yield_a =
+            if (fee_growth_global_a >= deposit_slot.fee_growth_debt_a) {
+                math128::mul_div(
+                    deposit_slot.share as u128,
+                    fee_growth_global_a - deposit_slot.fee_growth_debt_a,
+                    PRECISION
+                )
+            } else { 0 };
+
+        let pending_yield_b =
+            if (fee_growth_global_b >= deposit_slot.fee_growth_debt_b) {
+                math128::mul_div(
+                    deposit_slot.share as u128,
+                    fee_growth_global_b - deposit_slot.fee_growth_debt_b,
+                    PRECISION
+                )
+            } else { 0 };
 
         (pending_yield_a, pending_yield_b)
     }
@@ -602,3 +645,4 @@ module firyx::deposit_slot {
         assert!(withdrawal_value == 1200, 1);
     }
 }
+
