@@ -6,6 +6,8 @@ module firyx::loan_slot {
     use aptos_framework::math64;
     use aptos_framework::math128;
     use aptos_framework::error;
+    use aptos_framework::vector;
+    use aptos_framework::table::{Self, Table};
     use firyx::events;
 
     friend firyx::loan_position;
@@ -52,9 +54,60 @@ module firyx::loan_slot {
         supply: u128
     }
 
+    // Registry to track all loan slots by owner
+    struct LoanSlotRegistry has key {
+        owner_slots: Table<address, vector<address>>, // owner -> list of loan slot addresses
+        total_loan_slots: u64,
+        active_loan_slots: u64
+    }
+
     // === INIT ===
     fun init_module(deployer: &signer) {
         move_to(deployer, GlobalState { supply: 0 });
+        move_to(
+            deployer,
+            LoanSlotRegistry {
+                owner_slots: table::new<address, vector<address>>(),
+                total_loan_slots: 0,
+                active_loan_slots: 0
+            }
+        );
+    }
+
+    // === VIEW FUNCTIONS FOR TRACKING LOAN SLOTS BY OWNER ===
+
+    /// Get all loan slot addresses for a specific owner
+    #[view]
+    public fun get_owner_loan_slots(owner: address): vector<address> acquires LoanSlotRegistry {
+        let registry = borrow_global<LoanSlotRegistry>(@firyx);
+        if (registry.owner_slots.contains(owner)) {
+            *registry.owner_slots.borrow(owner)
+        } else {
+            vector::empty<address>()
+        }
+    }
+
+    /// Get total number of loan slots for a specific owner
+    #[view]
+    public fun get_owner_loan_slots_count(owner: address): u64 acquires LoanSlotRegistry {
+        let registry = borrow_global<LoanSlotRegistry>(@firyx);
+        if (registry.owner_slots.contains(owner)) {
+            registry.owner_slots.borrow(owner).length()
+        } else { 0 }
+    }
+
+    /// Get total number of loan slots across all owners
+    #[view]
+    public fun total_loan_slots(): u64 acquires LoanSlotRegistry {
+        let registry = borrow_global<LoanSlotRegistry>(@firyx);
+        registry.total_loan_slots
+    }
+
+    /// Get total number of active loan slots across all owners
+    #[view]
+    public fun active_loan_slots(): u64 acquires LoanSlotRegistry {
+        let registry = borrow_global<LoanSlotRegistry>(@firyx);
+        registry.active_loan_slots
     }
 
     // === CORE FUNCTIONS ===
@@ -65,7 +118,7 @@ module firyx::loan_slot {
         share: u128,
         reserve: u64,
         debt_idx_at_borrow: u128
-    ): Object<LoanSlot> {
+    ): Object<LoanSlot> acquires LoanSlotRegistry {
         assert_valid_amounts(principal, share, reserve);
         assert_valid_debt_index(debt_idx_at_borrow);
 
@@ -98,9 +151,22 @@ module firyx::loan_slot {
             object::object_from_constructor_ref<LoanSlot>(&constructor_ref);
         object::transfer(borrower, loan_slot_obj, borrower_addr);
 
+        // Update registry
+        let registry = borrow_global_mut<LoanSlotRegistry>(@firyx);
+        let loan_slot_addr = object::object_address(&loan_slot_obj);
+
+        if (!registry.owner_slots.contains(borrower_addr)) {
+            registry.owner_slots.add(borrower_addr, vector::empty<address>());
+        };
+        let owner_slots = registry.owner_slots.borrow_mut(borrower_addr);
+        owner_slots.push_back(loan_slot_addr);
+
+        registry.total_loan_slots += 1;
+        registry.active_loan_slots += 1;
+
         // Emit event
         events::emit_loan_slot_created(
-            object::object_address(&loan_slot_obj),
+            loan_slot_addr,
             borrower_addr,
             loan_pos_addr,
             principal,
@@ -119,7 +185,7 @@ module firyx::loan_slot {
         ls_obj: Object<LoanSlot>,
         current_debt_idx: u128,
         amount: u64
-    ): (u64, u64, bool, u128) acquires LoanSlot {
+    ): (u64, u64, bool, u128) acquires LoanSlot, LoanSlotRegistry {
         assert_is_owner(borrower, ls_obj);
         assert_valid_debt_index(current_debt_idx);
         assert_non_zero_amount(amount);
@@ -174,7 +240,7 @@ module firyx::loan_slot {
         ls_obj: Object<LoanSlot>,
         current_debt_idx: u128,
         amount: u64
-    ): (u64, u64, bool, u128) acquires LoanSlot {
+    ): (u64, u64, bool, u128) acquires LoanSlot, LoanSlotRegistry {
         assert_is_owner(borrower, ls_obj);
         assert_valid_debt_index(current_debt_idx);
 
@@ -220,6 +286,11 @@ module firyx::loan_slot {
 
         if (loan_repaid) {
             loan_slot.active = false;
+            // Update registry active count
+            let registry = borrow_global_mut<LoanSlotRegistry>(@firyx);
+            if (registry.active_loan_slots > 0) {
+                registry.active_loan_slots -= 1;
+            };
         };
 
         // Don't modify debt index per loan slot - it should remain global
@@ -410,30 +481,25 @@ module firyx::loan_slot {
         borrow_loan_slot(loan_slot_obj).reserve
     }
 
-
     #[view]
     public fun debt_idx_at_borrow(loan_slot_obj: Object<LoanSlot>): u128 acquires LoanSlot {
         borrow_loan_slot(loan_slot_obj).debt_idx_at_borrow
     }
-
 
     #[view]
     public fun fee_growth_debt_a(loan_slot_obj: Object<LoanSlot>): u128 acquires LoanSlot {
         borrow_loan_slot(loan_slot_obj).fee_growth_debt_a
     }
 
-
     #[view]
     public fun fee_growth_debt_b(loan_slot_obj: Object<LoanSlot>): u128 acquires LoanSlot {
         borrow_loan_slot(loan_slot_obj).fee_growth_debt_b
     }
 
-
     #[view]
     public fun is_active(loan_slot_obj: Object<LoanSlot>): bool acquires LoanSlot {
         borrow_loan_slot(loan_slot_obj).active
     }
-
 
     #[view]
     public fun current_debt(

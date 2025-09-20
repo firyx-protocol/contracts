@@ -4,6 +4,8 @@ module firyx::deposit_slot {
     use aptos_framework::timestamp;
     use aptos_framework::math128;
     use aptos_framework::error;
+    use aptos_framework::vector;
+    use aptos_framework::table::{Self, Table};
     use firyx::math::{bps};
     use firyx::events;
 
@@ -36,7 +38,7 @@ module firyx::deposit_slot {
         accumulated_deposits: u128, // Total amount deposited
         fee_growth_debt_a: u128,
         fee_growth_debt_b: u128,
-        share: u64, // Shares ownership trong pool
+        share: u64, // Shares ownership in pool
         created_at_ts: u64,
         active: bool,
         last_deposit_ts: u64,
@@ -48,12 +50,63 @@ module firyx::deposit_slot {
         active_deposits: u64
     }
 
+    // Registry to track all deposit slots by owner
+    struct DepositSlotRegistry has key {
+        owner_slots: Table<address, vector<address>>, // owner -> list of deposit slot addresses
+        total_deposit_slots: u64,
+        active_deposit_slots: u64
+    }
+
     // === INIT ===
     fun init_module(deployer: &signer) {
         move_to(
             deployer,
             GlobalState { total_deposits: 0, active_deposits: 0 }
         );
+        move_to(
+            deployer,
+            DepositSlotRegistry {
+                owner_slots: table::new<address, vector<address>>(),
+                total_deposit_slots: 0,
+                active_deposit_slots: 0
+            }
+        );
+    }
+
+    // === VIEW FUNCTIONS FOR TRACKING DEPOSIT SLOTS BY OWNER ===
+
+    /// Get all deposit slot addresses for a specific owner
+    #[view]
+    public fun get_owner_deposit_slots(owner: address): vector<address> acquires DepositSlotRegistry {
+        let registry = borrow_global<DepositSlotRegistry>(@firyx);
+        if (registry.owner_slots.contains(owner)) {
+            *registry.owner_slots.borrow(owner)
+        } else {
+            vector::empty<address>()
+        }
+    }
+
+    /// Get total number of deposit slots for a specific owner
+    #[view]
+    public fun get_owner_deposit_slots_count(owner: address): u64 acquires DepositSlotRegistry {
+        let registry = borrow_global<DepositSlotRegistry>(@firyx);
+        if (registry.owner_slots.contains(owner)) {
+            registry.owner_slots.borrow(owner).length()
+        } else { 0 }
+    }
+
+    /// Get total number of deposit slots across all owners
+    #[view]
+    public fun total_deposit_slots(): u64 acquires DepositSlotRegistry {
+        let registry = borrow_global<DepositSlotRegistry>(@firyx);
+        registry.total_deposit_slots
+    }
+
+    /// Get total number of active deposit slots across all owners
+    #[view]
+    public fun active_deposit_slots(): u64 acquires DepositSlotRegistry {
+        let registry = borrow_global<DepositSlotRegistry>(@firyx);
+        registry.active_deposit_slots
     }
 
     // === CORE FUNCTIONS ===
@@ -70,7 +123,7 @@ module firyx::deposit_slot {
         loan_pos_addr: address,
         principal: u128,
         shares: u64
-    ): Object<DepositSlot> acquires GlobalState {
+    ): Object<DepositSlot> acquires GlobalState, DepositSlotRegistry {
         let ts = timestamp::now_seconds();
         let deposit_info = DepositSlot {
             loan_pos_addr,
@@ -100,9 +153,22 @@ module firyx::deposit_slot {
             object::object_from_constructor_ref<DepositSlot>(&constructor_ref);
         object::transfer(lender, deposit_slot_obj, lender_addr);
 
+        // Update registry
+        let registry = borrow_global_mut<DepositSlotRegistry>(@firyx);
+        let deposit_slot_addr = object::object_address(&deposit_slot_obj);
+
+        if (!registry.owner_slots.contains(lender_addr)) {
+            registry.owner_slots.add(lender_addr, vector::empty<address>());
+        };
+        let owner_slots = registry.owner_slots.borrow_mut(lender_addr);
+        owner_slots.push_back(deposit_slot_addr);
+
+        registry.total_deposit_slots += 1;
+        registry.active_deposit_slots += 1;
+
         // Emit event
         events::emit_deposit_slot_created(
-            object::object_address(&deposit_slot_obj),
+            deposit_slot_addr,
             lender_addr,
             loan_pos_addr,
             principal,
@@ -198,7 +264,7 @@ module firyx::deposit_slot {
         amount: u128,
         total_pool_liquidity: u128,
         total_pool_shares: u64
-    ): (u64, u64, u64, bool) acquires DepositSlot, GlobalState {
+    ): (u64, u64, u64, bool) acquires DepositSlot, GlobalState, DepositSlotRegistry {
         assert_is_owner(lender, ds_obj);
         assert_valid_amount(amount);
 
@@ -246,6 +312,12 @@ module firyx::deposit_slot {
             // Update global state
             let state = borrow_global_mut<GlobalState>(@firyx);
             state.active_deposits -= 1;
+
+            // Update registry
+            let registry = borrow_global_mut<DepositSlotRegistry>(@firyx);
+            if (registry.active_deposit_slots > 0) {
+                registry.active_deposit_slots -= 1;
+            };
         };
 
         // Calculate updated position percentage
@@ -497,7 +569,7 @@ module firyx::deposit_slot {
     #[test(firyx = @firyx, aptos_framework = @0x1, lender = @0x123)]
     fun test_create_deposit_slot_basic(
         firyx: &signer, aptos_framework: &signer, lender: &signer
-    ) acquires DepositSlot, GlobalState {
+    ) acquires DepositSlot, GlobalState, DepositSlotRegistry {
         init_for_test(firyx, aptos_framework);
 
         let loan_pos_addr = @0x456;
@@ -508,10 +580,14 @@ module firyx::deposit_slot {
 
         // Verify deposit slot properties
         assert!(accumulated_deposits(deposit_obj) == principal, 1);
-        assert!(shares(deposit_obj) == shares, 2);
+        assert!(share(deposit_obj) == shares, 2);
         assert!(is_active(deposit_obj), 3);
         assert!(lender_address(deposit_obj) == signer::address_of(lender), 4);
         assert!(total_deposits() == 1, 5);
+
+        // Verify registry
+        assert!(total_deposit_slots() == 1, 6);
+        assert!(get_owner_deposit_slots_count(signer::address_of(lender)) == 1, 7);
     }
 
     #[test(firyx = @firyx, aptos_framework = @0x1, lender = @0x123)]

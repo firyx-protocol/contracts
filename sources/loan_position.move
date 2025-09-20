@@ -104,20 +104,23 @@ module firyx::loan_position {
         total_share: u128
     }
 
-    // Registry lưu toàn bộ loan position address và các thông số tổng hợp
+    // Registry stores all loan position addresses and aggregate data
     struct LoanPositionRegistry has key {
         positions: vector<address>,
         total_liquidity: u128,
         total_active_loans: u64
     }
 
-    // Hàm khởi tạo registry, gọi khi deploy hoặc test
-    public fun init_registry(admin: &signer) {
-        move_to(admin, LoanPositionRegistry {
-            positions: vector::empty<address>(),
-            total_liquidity: 0,
-            total_active_loans: 0
-        });
+    // Initialize registry function, called when deploying or testing
+    fun init_module(admin: &signer) {
+        move_to(
+            admin,
+            LoanPositionRegistry {
+                positions: vector::empty<address>(),
+                total_liquidity: 0,
+                total_active_loans: 0
+            }
+        );
     }
 
     public entry fun create_loan_position(
@@ -399,7 +402,7 @@ module firyx::loan_position {
         pos.available_borrow -= amount;
         pos.total_borrowed += amount;
 
-        // Handle edge case khi liquidity = 0
+        // Handle edge case when liquidity = 0
         pos.utilization =
             if (pos.liquidity > 0) {
                 let util = (pos.total_borrowed * bps()) / (pos.liquidity as u64);
@@ -531,9 +534,9 @@ module firyx::loan_position {
             signer::address_of(owner),
             object::object_address(&deposit_slot),
             yield_amount,
-            amount_fee_asset_a as u64,
-            amount_fee_asset_b as u64,
-            reward_assets_count as u64,
+            amount_fee_asset_a,
+            amount_fee_asset_b,
+            reward_assets_count,
             pos.last_update_ts
         );
     }
@@ -559,7 +562,7 @@ module firyx::loan_position {
 
         let ratio =
             if (pos.liquidity > 0) {
-                math128::mul_div(yield_amount as u128, precision(), pos.liquidity)
+                math128::mul_div(yield_amount, precision(), pos.liquidity)
             } else { 0 };
 
         let amount_fee_asset_a = fungible_asset::amount(&fee_asset_a);
@@ -658,7 +661,7 @@ module firyx::loan_position {
 
         let ratio =
             if (pos.liquidity > 0) {
-                math128::mul_div(yield_amount as u128, precision(), pos.liquidity)
+                math128::mul_div(yield_amount, precision(), pos.liquidity)
             } else { 0 };
 
         let amount_fee_asset_a = fungible_asset::amount(&fee_asset_a);
@@ -796,7 +799,7 @@ module firyx::loan_position {
                     params.kink_utilization
                 )
         } else {
-            // U >= U_optimal: Đảm bảo smooth transition
+            // U >= U_optimal: Ensure smooth transition
             let base_rate = BASE_RATE_BPS + params.slope_before_kink;
 
             if (utilization == params.kink_utilization) {
@@ -815,13 +818,13 @@ module firyx::loan_position {
     }
 
     fun calculate_share(position: &LoanPosition, amount: u128): u128 {
-        // Trường hợp đầu tiên - pool rỗng
+        // First case - empty pool
         if (position.total_share == 0 && position.liquidity == 0) { amount }
-        // Trường hợp bình thường
+        // Normal case
         else if (position.total_share > 0 && position.liquidity > 0) {
             math128::mul_div(amount, position.total_share, position.liquidity)
         }
-        // Trường hợp lỗi - không nên xảy ra
+        // Error case - should not happen
         else {
             abort E_INVALID_AMOUNT
         }
@@ -855,7 +858,7 @@ module firyx::loan_position {
             ) as u64;
 
         if (reserve == 0 && amount > 0) {
-            1 // Minimum reserve là 1 unit
+            1 // Minimum reserve is 1 unit
         } else {
             reserve
         }
@@ -984,7 +987,7 @@ module firyx::loan_position {
     /// Validate time elapsed is positive
     fun assert_valid_time_elapsed(time_elapsed: u64) {
         assert!(time_elapsed > 0, E_INVALID_TIME_ELAPSED);
-        let max_time_elapsed = 365 * 24 * 3600; // 1 năm tối đa
+        let max_time_elapsed = 365 * 24 * 3600; // Maximum 1 year
         assert!(time_elapsed <= max_time_elapsed, E_INVALID_TIME_ELAPSED);
     }
 
