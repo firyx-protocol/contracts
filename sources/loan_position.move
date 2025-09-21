@@ -135,7 +135,7 @@ module firyx::loan_position {
         slope_after_kink: u64,
         kink_utilization: u64,
         risk_factor: u8
-    ) {
+    ) acquires LoanPositionRegistry {
         assert_is_valid_loan_position_parameters(
             slope_before_kink,
             slope_after_kink,
@@ -145,11 +145,13 @@ module firyx::loan_position {
         assert_token_fee(&token_fee, &token_a, &token_b);
 
         let _seed_vector = vector[
-            bcs::to_bytes(&token_a), bcs::to_bytes(&token_b), bcs::to_bytes(&fee_tier), bcs::to_bytes(
-                &tick_lower
-            ), bcs::to_bytes(&tick_upper), bcs::to_bytes(&slope_before_kink), bcs::to_bytes(
-                &slope_after_kink
-            ), bcs::to_bytes(&kink_utilization), bcs::to_bytes(&risk_factor)
+            bcs::to_bytes(&@firyx), bcs::to_bytes(&token_a), bcs::to_bytes(&token_b), bcs::to_bytes(
+                &fee_tier
+            ), bcs::to_bytes(&tick_lower), bcs::to_bytes(&tick_upper), bcs::to_bytes(
+                &slope_before_kink
+            ), bcs::to_bytes(&slope_after_kink), bcs::to_bytes(&kink_utilization), bcs::to_bytes(
+                &risk_factor
+            )
         ];
 
         let seed = bcs::to_bytes(&_seed_vector);
@@ -203,6 +205,12 @@ module firyx::loan_position {
         let lending_position_object =
             object::object_from_constructor_ref<LoanPosition>(&constructor_ref);
 
+        // Update registry
+        let registry = borrow_global_mut<LoanPositionRegistry>(@firyx);
+        vector::push_back(
+            &mut registry.positions, object::object_address(&lending_position_object)
+        );
+
         events::emit_loan_position_created(
             object::object_address(&lending_position_object),
             token_a,
@@ -228,7 +236,7 @@ module firyx::loan_position {
         amount_b_desired: u64,
         amount_a_min: u64,
         amount_b_min: u64
-    ) acquires LoanPosition {
+    ) acquires LoanPosition, LoanPositionRegistry {
         assert_valid_amount(amount_a_desired);
         assert_valid_amount(amount_b_desired);
 
@@ -255,6 +263,10 @@ module firyx::loan_position {
         pos.liquidity += amount;
         pos.available_borrow = (pos.liquidity as u64) - pos.total_borrowed;
         pos.last_update_ts = timestamp::now_seconds();
+
+        // Update registry total liquidity
+        let registry = borrow_global_mut<LoanPositionRegistry>(@firyx);
+        registry.total_liquidity += amount;
 
         let signer_admin =
             &account::create_signer_with_capability(&pos.lending_position_cap.signer_cap);
@@ -377,7 +389,7 @@ module firyx::loan_position {
         token_fee: Object<Metadata>,
         amount: u64,
         duration_idx: u8
-    ) acquires LoanPosition {
+    ) acquires LoanPosition, LoanPositionRegistry {
         assert_valid_amount(amount);
         assert_valid_duration_index(duration_idx);
 
@@ -414,6 +426,10 @@ module firyx::loan_position {
             };
         pos.active_loans_count += 1;
         pos.last_update_ts = timestamp::now_seconds();
+
+        // Update registry total active loans
+        let registry = borrow_global_mut<LoanPositionRegistry>(@firyx);
+        registry.total_active_loans += 1;
 
         let share = calculate_share(pos, amount as u128);
         // Create loan slot for borrower
@@ -454,7 +470,7 @@ module firyx::loan_position {
         position: Object<LoanPosition>,
         loan_slot: Object<LoanSlot>,
         amount: u64
-    ) acquires LoanPosition {
+    ) acquires LoanPosition, LoanPositionRegistry {
         assert_valid_amount(amount);
 
         let pos = borrow_loan_position_mut(position);
@@ -497,6 +513,12 @@ module firyx::loan_position {
                 if (pos.active_loans_count > 0) {
                     pos.active_loans_count - 1
                 } else { 0 };
+
+            // Update registry total active loans
+            let registry = borrow_global_mut<LoanPositionRegistry>(@firyx);
+            if (registry.total_active_loans > 0) {
+                registry.total_active_loans -= 1;
+            };
         };
 
         pos.last_update_ts = current_ts;
@@ -869,6 +891,36 @@ module firyx::loan_position {
         object::address_to_object<LoanPosition>(position_addr)
     }
 
+    // === VIEW FUNCTIONS FOR TRACKING ALL POSITIONS ===
+
+    /// Get all loan position addresses
+    #[view]
+    public fun all_loan_position_addresses(): vector<address> acquires LoanPositionRegistry {
+        let registry = borrow_global<LoanPositionRegistry>(@firyx);
+        registry.positions
+    }
+
+    /// Get total number of loan positions
+    #[view]
+    public fun total_loan_positions(): u64 acquires LoanPositionRegistry {
+        let registry = borrow_global<LoanPositionRegistry>(@firyx);
+        registry.positions.length()
+    }
+
+    /// Get total liquidity across all positions
+    #[view]
+    public fun total_liquidity(): u128 acquires LoanPositionRegistry {
+        let registry = borrow_global<LoanPositionRegistry>(@firyx);
+        registry.total_liquidity
+    }
+
+    /// Get total active loans across all positions
+    #[view]
+    public fun total_active_loans(): u64 acquires LoanPositionRegistry {
+        let registry = borrow_global<LoanPositionRegistry>(@firyx);
+        registry.total_active_loans
+    }
+
     #[view]
     public fun get_position_info(
         position: Object<LoanPosition>
@@ -1060,7 +1112,7 @@ module firyx::loan_position {
     }
 
     #[test(aptos_framework = @0x1)]
-    fun test_create_loan_position_only(aptos_framework: &signer) {
+    fun test_create_loan_position_only(aptos_framework: &signer) acquires LoanPositionRegistry {
         init_for_testing(aptos_framework);
 
         let (a_constructor_ref, _) = fungible_asset::create_test_token(aptos_framework);
