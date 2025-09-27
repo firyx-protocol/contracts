@@ -8,7 +8,7 @@ authors = []
 firyx = "_"
 admin = "0x57c528d90af4255748b37f3730afdda043fad019be735e7d899f5565840e0366"
 deployer = "0xd548f6e8ef91c57e7983b1051df686a3753f3d453d37ef781782450e61079fe9"
-dex_contract = "0x8b4a2c4bb53857c718a04c020b98f8c2e1f99a68b0f57389a8bf5434cd22e05c"
+dex_contract = "0x1baf51f67dac7e629f8ee85bb16f8d049ef5b6d27b7e6bad3c703f94562dffdd"
 
 [dev-addresses]
 firyx = "0x111"
