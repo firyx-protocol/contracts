@@ -39,6 +39,8 @@ module firyx::deposit_slot {
         fee_growth_debt_a: u128,
         fee_growth_debt_b: u128,
         share: u64, // Shares ownership in pool
+        yield_earned_a: u128, // Yield earned from fee type A
+        yield_earned_b: u128, // Yield earned from fee type B
         created_at_ts: u64,
         active: bool,
         last_deposit_ts: u64,
@@ -75,8 +77,8 @@ module firyx::deposit_slot {
 
     // === VIEW FUNCTIONS FOR TRACKING DEPOSIT SLOTS BY OWNER ===
 
-    /// Get all deposit slot addresses for a specific owner
     #[view]
+    /// Get allsh u deposit slot addresses for a specific owner
     public fun get_owner_deposit_slots(owner: address): vector<address> acquires DepositSlotRegistry {
         let registry = borrow_global<DepositSlotRegistry>(@firyx);
         if (registry.owner_slots.contains(owner)) {
@@ -86,8 +88,8 @@ module firyx::deposit_slot {
         }
     }
 
-    /// Get total number of deposit slots for a specific owner
     #[view]
+    /// Get total number of deposit slots for a specific owner
     public fun get_owner_deposit_slots_count(owner: address): u64 acquires DepositSlotRegistry {
         let registry = borrow_global<DepositSlotRegistry>(@firyx);
         if (registry.owner_slots.contains(owner)) {
@@ -95,15 +97,15 @@ module firyx::deposit_slot {
         } else { 0 }
     }
 
-    /// Get total number of deposit slots across all owners
     #[view]
+    /// Get total number of deposit slots across all owners
     public fun total_deposit_slots(): u64 acquires DepositSlotRegistry {
         let registry = borrow_global<DepositSlotRegistry>(@firyx);
         registry.total_deposit_slots
     }
 
-    /// Get total number of active deposit slots across all owners
     #[view]
+    /// Get total number of active deposit slots across all owners
     public fun active_deposit_slots(): u64 acquires DepositSlotRegistry {
         let registry = borrow_global<DepositSlotRegistry>(@firyx);
         registry.active_deposit_slots
@@ -122,7 +124,9 @@ module firyx::deposit_slot {
         lender: &signer,
         loan_pos_addr: address,
         principal: u128,
-        shares: u64
+        shares: u64,
+        fee_growth_global_a: u128,
+        fee_growth_global_b: u128
     ): Object<DepositSlot> acquires GlobalState, DepositSlotRegistry {
         let ts = timestamp::now_seconds();
         let deposit_info = DepositSlot {
@@ -130,9 +134,11 @@ module firyx::deposit_slot {
             lender: signer::address_of(lender),
             original_principal: principal,
             accumulated_deposits: principal,
-            fee_growth_debt_a: 0,
-            fee_growth_debt_b: 0,
+            fee_growth_debt_a: fee_growth_global_a,
+            fee_growth_debt_b: fee_growth_global_b,
             share: shares,
+            yield_earned_a: 0,
+            yield_earned_b: 0,
             created_at_ts: ts,
             active: true,
             last_deposit_ts: ts,
@@ -544,6 +550,14 @@ module firyx::deposit_slot {
         (pending_yield_a, pending_yield_b)
     }
 
+    public(friend) fun update_yield_earned(
+        ds_obj: Object<DepositSlot>, yield_a: u128, yield_b: u128
+    ) acquires DepositSlot {
+        let deposit_slot = borrow_deposit_slot_mut(ds_obj);
+        deposit_slot.yield_earned_a += yield_a;
+        deposit_slot.yield_earned_b += yield_b;
+    }
+
     // === HELPER FUNCTIONS ===
 
     inline fun borrow_deposit_slot(object: Object<DepositSlot>): &DepositSlot {
@@ -576,7 +590,8 @@ module firyx::deposit_slot {
         let principal = 1000u128;
         let shares = 1000u64;
 
-        let deposit_obj = create_deposit_slot(lender, loan_pos_addr, principal, shares);
+        let deposit_obj =
+            create_deposit_slot(lender, loan_pos_addr, principal, shares, 0, 0);
 
         // Verify deposit slot properties
         assert!(accumulated_deposits(deposit_obj) == principal, 1);
@@ -596,7 +611,7 @@ module firyx::deposit_slot {
     ) acquires DepositSlot, GlobalState {
         init_for_test(firyx, aptos_framework);
 
-        let deposit_obj = create_deposit_slot(lender, @0x456, 0, 0);
+        let deposit_obj = create_deposit_slot(lender, @0x456, 0, 0, 0, 0);
         let amount = 1000u128;
         let total_pool_liquidity = 0u128;
         let total_pool_shares = 0u64;
@@ -623,7 +638,7 @@ module firyx::deposit_slot {
     ) acquires DepositSlot, GlobalState {
         init_for_test(firyx, aptos_framework);
 
-        let deposit_obj = create_deposit_slot(lender, @0x456, 1000, 1000);
+        let deposit_obj = create_deposit_slot(lender, @0x456, 1000, 1000, 0, 0);
         let additional_amount = 500u128;
         let total_pool_liquidity = 5000u128;
         let total_pool_shares = 5000u64;
@@ -651,7 +666,7 @@ module firyx::deposit_slot {
     ) acquires DepositSlot, GlobalState {
         init_for_test(firyx, aptos_framework);
 
-        let deposit_obj = create_deposit_slot(lender, @0x456, 1000, 1000);
+        let deposit_obj = create_deposit_slot(lender, @0x456, 1000, 1000, 0, 0);
         let withdraw_amount = 300u128;
         let total_pool_liquidity = 5000u128;
         let total_pool_shares = 5000u64;
@@ -678,7 +693,7 @@ module firyx::deposit_slot {
     ) acquires DepositSlot, GlobalState {
         init_for_test(firyx, aptos_framework);
 
-        let deposit_obj = create_deposit_slot(lender, @0x456, 1000, 1000);
+        let deposit_obj = create_deposit_slot(lender, @0x456, 1000, 1000, 0, 0);
         let total_pool_liquidity = 1000u128;
         let total_pool_shares = 1000u64;
 
@@ -704,7 +719,7 @@ module firyx::deposit_slot {
     ) acquires DepositSlot, GlobalState {
         init_for_test(firyx, aptos_framework);
 
-        let deposit_obj = create_deposit_slot(lender, @0x456, 1000, 1000);
+        let deposit_obj = create_deposit_slot(lender, @0x456, 1000, 1000, 0, 0);
 
         // Pool has grown due to interest
         let total_pool_liquidity = 6000u128; // 20% growth

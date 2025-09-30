@@ -1,7 +1,7 @@
 module firyx::loan_position {
+    use aptos_framework::aptos_coin;
     use aptos_framework::object::{Self, Object};
     use aptos_framework::account::{Self, SignerCapability};
-    use aptos_framework::aptos_coin::{Self};
     use aptos_framework::signer;
     use aptos_framework::timestamp;
     use aptos_framework::fungible_asset::{Self, Metadata};
@@ -61,6 +61,10 @@ module firyx::loan_position {
     const E_INVALID_DURATION_INDEX: u64 = 1017;
     /// Time elapsed must be greater than zero
     const E_INVALID_TIME_ELAPSED: u64 = 1018;
+    /// Repayment failed
+    const E_REPAYMENT_FAILED: u64 = 1019;
+    /// Not owner
+    const E_NOT_OWNER: u64 = 1020;
 
     struct LoanPositionParameters has copy, drop, store {
         // position parameters
@@ -83,6 +87,7 @@ module firyx::loan_position {
     }
 
     struct LoanPosition has key {
+        id: address,
         pos_object: Object<Info>,
         liquidity: u128,
         utilization: u64,
@@ -173,6 +178,7 @@ module firyx::loan_position {
         move_to(
             &container_signer,
             LoanPosition {
+                id: object::address_from_constructor_ref(&constructor_ref),
                 pos_object,
                 liquidity: 0,
                 utilization: 0,
@@ -284,6 +290,9 @@ module firyx::loan_position {
                 DEFAULT_DEADLINE_TS
             );
 
+        // Ensure claim fee and rewards
+        ensure_claim_fee_and_rewards(pos);
+
         // Refund remaining tokens to lender
         if (remain_amount_token_a > 0) {
             primary_fungible_store::deposit(signer::address_of(lender), remain_token_a);
@@ -301,7 +310,9 @@ module firyx::loan_position {
                 lender,
                 object::object_address(&position),
                 amount,
-                share as u64
+                share as u64,
+                pos.fee_growth_global_a,
+                pos.fee_growth_global_b
             );
 
         // Initialize fee growth debt for new deposit slot
@@ -324,77 +335,6 @@ module firyx::loan_position {
         );
     }
 
-    public entry fun deposit_liquidity_single(
-        lender: &signer,
-        position: Object<LoanPosition>,
-        from_a: Object<Metadata>,
-        to_b: Object<Metadata>,
-        amount_in: u64,
-        slippage_numerators: u256,
-        slippage_denominator: u256,
-        threshold_numerator: u256,
-        threshold_denominator: u256
-    ) acquires LoanPosition {
-        assert_valid_amount(amount_in);
-
-        let pos_addr = object::object_address(&position);
-        let pos = borrow_global_mut<LoanPosition>(pos_addr);
-        assert_position_active(pos);
-
-        let share = calculate_share_internal(pos, amount_in as u128);
-
-        pos.total_share += share;
-        pos.liquidity += amount_in as u128;
-        pos.available_borrow = (pos.liquidity as u64) - pos.total_borrowed;
-        pos.last_update_ts = timestamp::now_seconds();
-
-        let signer_admin =
-            &account::create_signer_with_capability(&pos.lending_position_cap.signer_cap);
-
-        primary_fungible_store::transfer(
-            lender,
-            from_a,
-            signer::address_of(signer_admin),
-            amount_in
-        );
-
-        router_v3::add_liquidity_single(
-            signer_admin,
-            pos.pos_object,
-            from_a,
-            to_b,
-            amount_in,
-            slippage_numerators,
-            slippage_denominator,
-            threshold_numerator,
-            threshold_denominator
-        );
-
-        let deposit_slot_obj =
-            deposit_slot::create_deposit_slot(
-                lender, pos_addr, amount_in as u128, share as u64
-            );
-
-        // Initialize fee growth debt for new deposit slot
-        deposit_slot::update_fee_growth_debt(
-            deposit_slot_obj,
-            pos.fee_growth_global_a,
-            pos.fee_growth_global_b
-        );
-
-        events::emit_liquidity_deposited(
-            object::object_address(&position),
-            signer::address_of(lender),
-            object::object_address(&deposit_slot_obj),
-            amount_in as u128,
-            share as u64,
-            pos.liquidity,
-            pos.total_share,
-            pos.utilization,
-            pos.last_update_ts
-        );
-    }
-
     public entry fun borrow_liquidity(
         borrower: &signer,
         position: Object<LoanPosition>,
@@ -406,6 +346,7 @@ module firyx::loan_position {
         assert_valid_duration_index(duration_idx);
 
         let pos = borrow_loan_position_mut(position);
+
         assert_position_active(pos);
         assert_token_fee_of_loan_position(pos, &token_fee);
         assert_sufficient_available_borrow(pos, amount);
@@ -414,13 +355,9 @@ module firyx::loan_position {
         let admin_signer =
             account::create_signer_with_capability(&pos.lending_position_cap.signer_cap);
 
+        let reserve_fa = primary_fungible_store::withdraw(borrower, token_fee, reserve);
         // Transfer reserve from borrower to loan position
-        primary_fungible_store::transfer(
-            borrower,
-            token_fee,
-            signer::address_of(&admin_signer),
-            reserve
-        );
+        primary_fungible_store::deposit(signer::address_of(&admin_signer), reserve_fa);
 
         // Update position state
         pos.available_borrow -= amount;
@@ -444,6 +381,10 @@ module firyx::loan_position {
         registry.total_active_loans += 1;
 
         let share = calculate_share_internal(pos, amount as u128);
+
+        // Ensure claim fee and rewards
+        ensure_claim_fee_and_rewards(pos);
+
         // Create loan slot for borrower
         let loan_slot_obj =
             loan_slot::create_loan_slot(
@@ -452,7 +393,10 @@ module firyx::loan_position {
                 amount as u128,
                 share,
                 reserve,
-                pos.current_debt_idx
+                duration_idx,
+                pos.current_debt_idx,
+                pos.fee_growth_global_a,
+                pos.fee_growth_global_b
             );
 
         // Initialize fee growth debt for new loan slot
@@ -478,22 +422,44 @@ module firyx::loan_position {
     }
 
     public entry fun loan_slot_claim_yield_and_repay(
-        owner: &signer,
-        position: Object<LoanPosition>,
-        loan_slot: Object<LoanSlot>,
-        amount: u64
+        owner: &signer, position: Object<LoanPosition>, loan_slot: Object<LoanSlot>
     ) acquires LoanPosition, LoanPositionRegistry {
-        assert_valid_amount(amount);
+        assert_is_owner(loan_slot, signer::address_of(owner));
 
         let pos = borrow_loan_position_mut(position);
         assert_position_active(pos);
+
+        // Ensure claim yield first
+        ensure_claim_fee_and_rewards(pos);
+
+        let share = loan_slot::share(loan_slot);
+
+        if (share > 0) {
+            let (
+                yield_amount, amount_fee_asset_a, amount_fee_asset_b, reward_assets_count
+            ) = loan_slot_claim_yield_internal(owner, pos, loan_slot);
+
+            events::emit_yield_claimed(
+                object::object_address(&position),
+                signer::address_of(owner),
+                object::object_address(&loan_slot),
+                yield_amount,
+                amount_fee_asset_a,
+                amount_fee_asset_b,
+                reward_assets_count,
+                timestamp::now_seconds()
+            );
+        };
 
         let current_ts = timestamp::now_seconds();
         let time_elapsed = current_ts - pos.last_accrual_ts;
         assert_valid_time_elapsed(time_elapsed);
 
+        let loan_slot_principal = loan_slot::principal(loan_slot);
+        let debt_idx_at_borrow = loan_slot::debt_idx_at_borrow(loan_slot);
+
         let current_debt_idx = pos.current_debt_idx;
-        let apr = calculate_apr_internal(pos, pos.utilization);
+        let apr = calculate_apr_internal(pos, loan_slot_principal);
         let new_debt_idx = updated_debt_index(current_debt_idx, apr, time_elapsed);
 
         // Emit debt index update event
@@ -508,9 +474,22 @@ module firyx::loan_position {
 
         pos.current_debt_idx = new_debt_idx;
         pos.last_accrual_ts = current_ts;
+        let amount_to_repay =
+            math128::mul_div(
+                loan_slot_principal,
+                new_debt_idx,
+                debt_idx_at_borrow
+            ) as u64;
 
-        let (principal_repaid, _interest_repaid, loan_repaid, _) =
-            loan_slot::repay(owner, loan_slot, pos.current_debt_idx, amount);
+        let (principal_repaid, interest_repaid, loan_repaid, _) =
+            loan_slot::repay(
+                owner,
+                loan_slot,
+                pos.current_debt_idx,
+                amount_to_repay
+            );
+
+        assert!(loan_repaid, E_REPAYMENT_FAILED);
 
         // Update position state
         pos.total_borrowed -= principal_repaid;
@@ -520,46 +499,41 @@ module firyx::loan_position {
                 (pos.total_borrowed * bps()) / (pos.liquidity as u64)
             } else { 0 };
 
-        if (loan_repaid) {
-            pos.active_loans_count =
-                if (pos.active_loans_count > 0) {
-                    pos.active_loans_count - 1
-                } else { 0 };
+        pos.active_loans_count =
+            if (pos.active_loans_count > 0) {
+                pos.active_loans_count - 1
+            } else { 0 };
 
-            // Update registry total active loans
-            let registry = borrow_global_mut<LoanPositionRegistry>(@firyx);
-            if (registry.total_active_loans > 0) {
-                registry.total_active_loans -= 1;
-            };
+        let registry = borrow_global_mut<LoanPositionRegistry>(@firyx);
+        if (registry.total_active_loans > 0) {
+            registry.total_active_loans -= 1;
         };
 
         pos.last_update_ts = current_ts;
 
-        let share = loan_slot::share(loan_slot);
-        if (share > 0) {
-            let (
-                yield_amount, amount_fee_asset_a, amount_fee_asset_b, reward_assets_count
-            ) = loan_slot_claim_yield_internal(owner, pos, loan_slot);
-
-            events::emit_yield_claimed(
-                object::object_address(&position),
-                signer::address_of(owner),
-                object::object_address(&loan_slot),
-                yield_amount,
-                amount_fee_asset_a,
-                amount_fee_asset_b,
-                reward_assets_count,
-                pos.last_update_ts
-            );
-        };
+        events::emit_loan_repaid(
+            object::object_address(&loan_slot),
+            signer::address_of(owner),
+            principal_repaid + interest_repaid,
+            principal_repaid,
+            interest_repaid,
+            loan_slot::principal(loan_slot),
+            loan_repaid,
+            pos.current_debt_idx,
+            current_ts
+        );
     }
 
     public entry fun deposit_slot_claim_yield(
         owner: &signer, position: Object<LoanPosition>, deposit_slot: Object<DepositSlot>
     ) acquires LoanPosition {
+        assert_is_owner(deposit_slot, signer::address_of(owner));
         let pos = borrow_loan_position_mut(position);
         assert_position_active(pos);
 
+        // Ensure claim yield first
+        ensure_claim_fee_and_rewards(pos);
+        
         let (yield_amount, amount_fee_asset_a, amount_fee_asset_b, reward_assets_count) =
             deposit_slot_claim_yield_internal(owner, pos, deposit_slot);
 
@@ -586,48 +560,67 @@ module firyx::loan_position {
             E_INVALID_AMOUNT
         );
 
-        let yield_amount = math128::mul_div(share as u128, pos.liquidity, pos.total_share);
-        assert_valid_amount(yield_amount as u64);
+        let fee_debt_a = deposit_slot::fee_growth_debt_a(deposit_slot);
+        let fee_debt_b = deposit_slot::fee_growth_debt_b(deposit_slot);
+
+        let accumulated_fee_a =
+            if (pos.fee_growth_global_a > fee_debt_a) {
+                math128::mul_div(
+                    pos.fee_growth_global_a - fee_debt_a,
+                    share as u128,
+                    precision()
+                ) as u64
+            } else { 0 };
+
+        let accumulated_fee_b =
+            if (pos.fee_growth_global_b > fee_debt_b) {
+                math128::mul_div(
+                    pos.fee_growth_global_b - fee_debt_b,
+                    share as u128,
+                    precision()
+                ) as u64
+            } else { 0 };
 
         let (fee_asset_a, fee_asset_b) =
             pool_v3::claim_fees(&admin_signer, pos.pos_object);
 
-        let rewared_assets = pool_v3::claim_rewards(&admin_signer, pos.pos_object);
+        accure_fee_growth_global(pos, accumulated_fee_a, accumulated_fee_b);
 
+        let metadata_a = fungible_asset::metadata_from_asset(&fee_asset_a);
+        let metadata_b = fungible_asset::metadata_from_asset(&fee_asset_b);
+
+        primary_fungible_store::deposit(signer::address_of(&admin_signer), fee_asset_a);
+        primary_fungible_store::deposit(signer::address_of(&admin_signer), fee_asset_b);
+
+        deposit_slot::update_yield_earned(
+            deposit_slot, accumulated_fee_a as u128, accumulated_fee_b as u128
+        );
+
+        if (accumulated_fee_a > 0) {
+            let user_fee_a =
+                primary_fungible_store::withdraw(
+                    &admin_signer, metadata_a, accumulated_fee_a
+                );
+            primary_fungible_store::deposit(signer::address_of(owner), user_fee_a);
+        };
+
+        if (accumulated_fee_b > 0) {
+            let user_fee_b =
+                primary_fungible_store::withdraw(
+                    &admin_signer, metadata_b, accumulated_fee_b
+                );
+            primary_fungible_store::deposit(signer::address_of(owner), user_fee_b);
+        };
+
+        let rewared_assets = pool_v3::claim_rewards(&admin_signer, pos.pos_object);
+        let yield_amount = math128::mul_div(share as u128, pos.liquidity, pos.total_share);
         let ratio =
             if (pos.liquidity > 0) {
                 math128::mul_div(yield_amount, precision(), pos.liquidity)
             } else { 0 };
 
-        let amount_fee_asset_a = fungible_asset::amount(&fee_asset_a);
-        let amount_fee_asset_b = fungible_asset::amount(&fee_asset_b);
-        let yield_fee_asset_a =
-            math128::mul_div(amount_fee_asset_a as u128, ratio, precision()) as u64;
-        let yield_fee_asset_b =
-            math128::mul_div(amount_fee_asset_b as u128, ratio, precision()) as u64;
+        assert_valid_amount(yield_amount as u64);
 
-        // Split fee assets - extract yield portion first, then deposit remainder
-        let yield_portion_a = if (yield_fee_asset_a > 0 && amount_fee_asset_a >= yield_fee_asset_a) {
-            fungible_asset::extract(&mut fee_asset_a, yield_fee_asset_a)
-        } else {
-            fungible_asset::zero(fungible_asset::asset_metadata(&fee_asset_a))
-        };
-
-        let yield_portion_b = if (yield_fee_asset_b > 0 && amount_fee_asset_b >= yield_fee_asset_b) {
-            fungible_asset::extract(&mut fee_asset_b, yield_fee_asset_b)
-        } else {
-            fungible_asset::zero(fungible_asset::asset_metadata(&fee_asset_b))
-        };
-
-        // Transfer yield portions to owner
-        primary_fungible_store::deposit(signer::address_of(owner), yield_portion_a);
-        primary_fungible_store::deposit(signer::address_of(owner), yield_portion_b);
-
-        // Deposit remaining fee assets to admin store
-        primary_fungible_store::deposit(signer::address_of(&admin_signer), fee_asset_a);
-        primary_fungible_store::deposit(signer::address_of(&admin_signer), fee_asset_b);
-
-        // Reward assets transfer
         let reward_assets_count = rewared_assets.length();
         rewared_assets.for_each(
             |asset| {
@@ -636,36 +629,24 @@ module firyx::loan_position {
                     let yield_amount_asset =
                         math128::mul_div(amount_asset as u128, ratio, precision()) as u64;
                     if (yield_amount_asset > 0 && amount_asset >= yield_amount_asset) {
-                        let yield_portion = fungible_asset::extract(&mut asset, yield_amount_asset);
-                        primary_fungible_store::deposit(signer::address_of(owner), yield_portion);
+                        let yield_portion =
+                            fungible_asset::extract(&mut asset, yield_amount_asset);
+                        primary_fungible_store::deposit(
+                            signer::address_of(owner), yield_portion
+                        );
                     };
                 };
-                // Deposit remaining reward asset to admin store
                 primary_fungible_store::deposit(signer::address_of(&admin_signer), asset);
             }
         );
 
-        pos.total_interest_earned += yield_amount;
-        // Update fee growth global based on fees collected
-        let fee_growth_per_share_a =
-            if (pos.total_share > 0) {
-                math128::mul_div(amount_fee_asset_a as u128, precision(), pos.total_share)
-            } else { 0 };
-        let fee_growth_per_share_b =
-            if (pos.total_share > 0) {
-                math128::mul_div(amount_fee_asset_b as u128, precision(), pos.total_share)
-            } else { 0 };
-        pos.fee_growth_global_a += fee_growth_per_share_a;
-        pos.fee_growth_global_b += fee_growth_per_share_b;
-        // Update deposit slot fee growth debt to current global values
         deposit_slot::update_fee_growth_debt(
-            deposit_slot,
-            pos.fee_growth_global_a,
-            pos.fee_growth_global_b
+            deposit_slot, pos.fee_growth_global_a, pos.fee_growth_global_b
         );
+        pos.total_interest_earned += yield_amount;
         pos.last_update_ts = timestamp::now_seconds();
 
-        (yield_amount, amount_fee_asset_a, amount_fee_asset_b, reward_assets_count)
+        (yield_amount, accumulated_fee_a, accumulated_fee_b, reward_assets_count)
     }
 
     fun loan_slot_claim_yield_internal(
@@ -679,48 +660,57 @@ module firyx::loan_position {
             E_INVALID_AMOUNT
         );
 
-        let yield_amount = math128::mul_div(share, pos.liquidity, pos.total_share);
-        assert_valid_amount(yield_amount as u64);
+        let fee_debt_a = loan_slot::fee_growth_debt_a(loan_slot);
+        let fee_debt_b = loan_slot::fee_growth_debt_b(loan_slot);
+
+        let accumulated_fee_a =
+            if (pos.fee_growth_global_a > fee_debt_a) {
+                math128::mul_div(pos.fee_growth_global_a - fee_debt_a, share, precision()) as u64
+            } else { 0 };
+
+        let accumulated_fee_b =
+            if (pos.fee_growth_global_b > fee_debt_b) {
+                math128::mul_div(pos.fee_growth_global_b - fee_debt_b, share, precision()) as u64
+            } else { 0 };
 
         let (fee_asset_a, fee_asset_b) =
             pool_v3::claim_fees(&admin_signer, pos.pos_object);
 
-        let rewared_assets = pool_v3::claim_rewards(&admin_signer, pos.pos_object);
+        accure_fee_growth_global(pos, accumulated_fee_a, accumulated_fee_b);
 
+        let metadata_a = fungible_asset::metadata_from_asset(&fee_asset_a);
+        let metadata_b = fungible_asset::metadata_from_asset(&fee_asset_b);
+
+        primary_fungible_store::deposit(signer::address_of(&admin_signer), fee_asset_a);
+        primary_fungible_store::deposit(signer::address_of(&admin_signer), fee_asset_b);
+
+        loan_slot::update_yield_earned(
+            loan_slot, accumulated_fee_a as u128, accumulated_fee_b as u128
+        );
+
+        if (accumulated_fee_a > 0) {
+            let user_fee_a =
+                primary_fungible_store::withdraw(
+                    &admin_signer, metadata_a, accumulated_fee_a
+                );
+            primary_fungible_store::deposit(signer::address_of(owner), user_fee_a);
+        };
+
+        if (accumulated_fee_b > 0) {
+            let user_fee_b =
+                primary_fungible_store::withdraw(
+                    &admin_signer, metadata_b, accumulated_fee_b
+                );
+            primary_fungible_store::deposit(signer::address_of(owner), user_fee_b);
+        };
+
+        let rewared_assets = pool_v3::claim_rewards(&admin_signer, pos.pos_object);
+        let yield_amount = math128::mul_div(share, pos.liquidity, pos.total_share);
         let ratio =
             if (pos.liquidity > 0) {
                 math128::mul_div(yield_amount, precision(), pos.liquidity)
             } else { 0 };
 
-        let amount_fee_asset_a = fungible_asset::amount(&fee_asset_a);
-        let amount_fee_asset_b = fungible_asset::amount(&fee_asset_b);
-        let yield_fee_asset_a =
-            math128::mul_div(amount_fee_asset_a as u128, ratio, precision()) as u64;
-        let yield_fee_asset_b =
-            math128::mul_div(amount_fee_asset_b as u128, ratio, precision()) as u64;
-
-        // Split fee assets - extract yield portion first, then deposit remainder
-        let yield_portion_a = if (yield_fee_asset_a > 0 && amount_fee_asset_a >= yield_fee_asset_a) {
-            fungible_asset::extract(&mut fee_asset_a, yield_fee_asset_a)
-        } else {
-            fungible_asset::zero(fungible_asset::asset_metadata(&fee_asset_a))
-        };
-
-        let yield_portion_b = if (yield_fee_asset_b > 0 && amount_fee_asset_b >= yield_fee_asset_b) {
-            fungible_asset::extract(&mut fee_asset_b, yield_fee_asset_b)
-        } else {
-            fungible_asset::zero(fungible_asset::asset_metadata(&fee_asset_b))
-        };
-
-        // Transfer yield portions to owner
-        primary_fungible_store::deposit(signer::address_of(owner), yield_portion_a);
-        primary_fungible_store::deposit(signer::address_of(owner), yield_portion_b);
-
-        // Deposit remaining fee assets to admin store
-        primary_fungible_store::deposit(signer::address_of(&admin_signer), fee_asset_a);
-        primary_fungible_store::deposit(signer::address_of(&admin_signer), fee_asset_b);
-
-        // Reward assets transfer
         let reward_assets_count = rewared_assets.length();
         rewared_assets.for_each(
             |asset| {
@@ -729,41 +719,66 @@ module firyx::loan_position {
                     let yield_amount_asset =
                         math128::mul_div(amount_asset as u128, ratio, precision()) as u64;
                     if (yield_amount_asset > 0 && amount_asset >= yield_amount_asset) {
-                        let yield_portion = fungible_asset::extract(&mut asset, yield_amount_asset);
-                        primary_fungible_store::deposit(signer::address_of(owner), yield_portion);
+                        let yield_portion =
+                            fungible_asset::extract(&mut asset, yield_amount_asset);
+                        primary_fungible_store::deposit(
+                            signer::address_of(owner), yield_portion
+                        );
                     };
                 };
-                // Deposit remaining reward asset to admin store
                 primary_fungible_store::deposit(signer::address_of(&admin_signer), asset);
             }
         );
 
-        pos.total_interest_earned += yield_amount;
-
-        // Update fee growth global based on fees collected
-        let fee_growth_per_share_a =
-            if (pos.total_share > 0) {
-                math128::mul_div(amount_fee_asset_a as u128, precision(), pos.total_share)
-            } else { 0 };
-
-        let fee_growth_per_share_b =
-            if (pos.total_share > 0) {
-                math128::mul_div(amount_fee_asset_b as u128, precision(), pos.total_share)
-            } else { 0 };
-
-        pos.fee_growth_global_a += fee_growth_per_share_a;
-        pos.fee_growth_global_b += fee_growth_per_share_b;
-
-        // Update loan slot fee growth debt to current global values
         loan_slot::update_fee_growth_debt(
-            loan_slot,
-            pos.fee_growth_global_a,
-            pos.fee_growth_global_b
+            loan_slot, pos.fee_growth_global_a, pos.fee_growth_global_b
         );
-
+        pos.total_interest_earned += yield_amount;
         pos.last_update_ts = timestamp::now_seconds();
 
-        (yield_amount, amount_fee_asset_a, amount_fee_asset_b, reward_assets_count)
+        (yield_amount, accumulated_fee_a, accumulated_fee_b, reward_assets_count)
+    }
+
+    public fun ensure_claim_fee_and_rewards(pos: &mut LoanPosition) {
+        let admin_signer =
+            account::create_signer_with_capability(&pos.lending_position_cap.signer_cap);
+        let (fee_asset_a, fee_asset_b) =
+            pool_v3::claim_fees(&admin_signer, pos.pos_object);
+        accure_fee_growth_global(
+            pos,
+            fungible_asset::amount(&fee_asset_a),
+            fungible_asset::amount(&fee_asset_b)
+        );
+        primary_fungible_store::deposit(signer::address_of(&admin_signer), fee_asset_a);
+        primary_fungible_store::deposit(signer::address_of(&admin_signer), fee_asset_b);
+
+        let rewared_assets = pool_v3::claim_rewards(&admin_signer, pos.pos_object);
+        rewared_assets.for_each(|asset| {
+            primary_fungible_store::deposit(signer::address_of(&admin_signer), asset);
+        });
+
+        pos.last_update_ts = timestamp::now_seconds();
+    }
+
+    fun accure_fee_growth_global(
+        pos: &mut LoanPosition, fee_asset_a: u64, fee_asset_b: u64
+    ) {
+
+        if (fee_asset_a > 0 || fee_asset_b > 0) {
+            let fee_growth_per_share_a =
+                if (pos.total_share > 0) {
+                    math128::mul_div(fee_asset_a as u128, precision(), pos.total_share)
+                } else { 0 };
+            let fee_growth_per_share_b =
+                if (pos.total_share > 0) {
+                    math128::mul_div(fee_asset_b as u128, precision(), pos.total_share)
+                } else { 0 };
+
+            pos.fee_growth_global_a += fee_growth_per_share_a;
+            pos.fee_growth_global_b += fee_growth_per_share_b;
+        };
+
+        pos.last_update_ts = timestamp::now_seconds();
     }
 
     fun updated_debt_index(
@@ -808,9 +823,17 @@ module firyx::loan_position {
         }
     }
 
-    fun calculate_apr_internal(pos: &LoanPosition, utilization: u64): u64 {
-        assert_valid_utilization(utilization);
+    fun calculate_apr_internal(pos: &LoanPosition, amount: u128): u64 {
+        assert_valid_utilization(pos.utilization);
         let params = &pos.parameters;
+        let utilization =
+            math64::mul_div(
+                (pos.total_borrowed as u64) + (amount as u64),
+                bps(),
+                pos.liquidity as u64
+            );
+
+        assert_valid_utilization(utilization);
 
         if (utilization < params.kink_utilization) {
             // U < U_optimal
@@ -857,32 +880,37 @@ module firyx::loan_position {
     ): u64 {
         assert_valid_duration_index(duration_idx);
 
-        let apr = calculate_apr_internal(pos, pos.utilization);
+        let apr = calculate_apr_internal(pos, amount);
         let duration_year_bps = DURATION_YEAR_VECTOR_BPS[duration_idx as u64];
         let multiplier_terms_adjustment_bps =
             MULTIPLIER_TERMS_ADJUSTMENT_BPS[duration_idx as u64];
-        let risk_factor = pos.parameters.risk_factor;
+        let risk_factor_bps = RISK_FACTOR_BFS_VECTOR[pos.parameters.risk_factor as u64];
 
-        let reserve =
-            math128::mul_div(
-                math128::mul_div(
-                    math128::mul_div(
-                        amount * (apr as u128),
-                        duration_year_bps as u128,
-                        (bps() as u128)
-                    ),
-                    (RISK_FACTOR_BFS_VECTOR[risk_factor as u64] as u128)
-                        * (multiplier_terms_adjustment_bps as u128),
-                    (bps() as u128) * (bps() as u128)
-                ),
-                1,
-                bps() as u128
-            ) as u64;
+        // Simplified calculation to avoid precision loss
+        // reserve = (amount * apr * duration_year_bps * risk_factor_bps * multiplier_terms_adjustment_bps) / (bps^4)
+        let numerator =
+            amount * (apr as u128) * (duration_year_bps as u128)
+                * (risk_factor_bps as u128) * (multiplier_terms_adjustment_bps as u128);
 
+        let denominator = (bps() as u128) * (bps() as u128) * (bps() as u128)
+            * (bps() as u128); // bps^4
+
+        let reserve = numerator / denominator;
+
+        // Ensure minimum reserve for non-zero amounts
         if (reserve == 0 && amount > 0) {
-            1 // Minimum reserve is 1 unit
+            // Calculate minimum based on amount size
+            let min_reserve =
+                if (amount >= 1000000) { // >= 1M
+                    amount / 10000 // 0.01% of amount
+                } else if (amount >= 10000) { // >= 10K
+                    amount / 1000 // 0.1% of amount
+                } else {
+                    1 // Minimum 1 unit
+                };
+            min_reserve as u64
         } else {
-            reserve
+            reserve as u64
         }
     }
 
@@ -893,83 +921,32 @@ module firyx::loan_position {
 
     // === VIEW FUNCTIONS FOR TRACKING ALL POSITIONS ===
 
-    /// Get all loan position addresses
     #[view]
+    /// Get all loan position addresses
     public fun all_loan_position_addresses(): vector<address> acquires LoanPositionRegistry {
         let registry = borrow_global<LoanPositionRegistry>(@firyx);
         registry.positions
     }
 
-    /// Get total number of loan positions
     #[view]
+    /// Get total number of loan positions
     public fun total_loan_positions(): u64 acquires LoanPositionRegistry {
         let registry = borrow_global<LoanPositionRegistry>(@firyx);
         registry.positions.length()
     }
 
-    /// Get total liquidity across all positions
     #[view]
+    /// Get total liquidity across all positions
     public fun total_liquidity(): u128 acquires LoanPositionRegistry {
         let registry = borrow_global<LoanPositionRegistry>(@firyx);
         registry.total_liquidity
     }
 
-    /// Get total active loans across all positions
     #[view]
+    /// Get total active loans across all positions
     public fun total_active_loans(): u64 acquires LoanPositionRegistry {
         let registry = borrow_global<LoanPositionRegistry>(@firyx);
         registry.total_active_loans
-    }
-
-    #[view]
-    public fun get_position_info(
-        position: Object<LoanPosition>
-    ): (
-        // Basic info
-        u128, // liquidity
-        u64, // utilization
-        u64, // available_borrow
-        u64, // total_borrowed
-        u128, // current_debt_idx
-        u128, // total_share
-
-        // Status
-        bool, // active
-        u64, // created_at_ts
-        u64, // last_update_ts
-        u64, // active_loans_count
-        u128, // total_interest_earned
-
-        // Parameters
-        u8, // fee_tier
-        u32, // tick_lower
-        u32, // tick_upper
-        u64, // slope_before_kink
-        u64, // slope_after_kink
-        u64, // kink_utilization
-        u8 // risk_factor
-    ) acquires LoanPosition {
-        let pos = borrow_loan_position(position);
-        (
-            pos.liquidity,
-            pos.utilization,
-            pos.available_borrow,
-            pos.total_borrowed,
-            pos.current_debt_idx,
-            pos.total_share,
-            pos.active,
-            pos.created_at_ts,
-            pos.last_update_ts,
-            pos.active_loans_count,
-            pos.total_interest_earned,
-            pos.parameters.fee_tier,
-            pos.parameters.tick_lower,
-            pos.parameters.tick_upper,
-            pos.parameters.slope_before_kink,
-            pos.parameters.slope_after_kink,
-            pos.parameters.kink_utilization,
-            pos.parameters.risk_factor
-        )
     }
 
     #[view]
@@ -992,11 +969,9 @@ module firyx::loan_position {
     }
 
     #[view]
-    public fun calculate_apr(
-        pos_obj: Object<LoanPosition>, utilization: u64
-    ): u64 acquires LoanPosition {
+    public fun calculate_apr(pos_obj: Object<LoanPosition>, amount: u128): u64 acquires LoanPosition {
         let pos = borrow_loan_position(pos_obj);
-        calculate_apr_internal(pos, utilization)
+        calculate_apr_internal(pos, amount)
     }
 
     #[view]
@@ -1006,8 +981,139 @@ module firyx::loan_position {
         let pos = borrow_loan_position(pos_obj);
         calculate_reserve_internal(pos, amount, duration_idx)
     }
-    
+
+    #[view]
+    public fun calculate_deposit_slot_yield(
+        pos_obj: Object<LoanPosition>, deposit_slot: Object<DepositSlot>
+    ): (u128, u64, u64, u64) acquires LoanPosition {
+        let pos = borrow_loan_position(pos_obj);
+        let share = deposit_slot::share(deposit_slot);
+
+        if (share == 0 || pos.total_share == 0 || pos.liquidity == 0) {
+            return (0, 0, 0, 0)
+        };
+
+        let yield_amount = math128::mul_div(share as u128, pos.liquidity, pos.total_share);
+        let pending_fee = pool_v3::get_pending_fees(pos.pos_object);
+        let pending_fee_a = pending_fee[0];
+        let pending_fee_b = pending_fee[1];
+
+        let simulated_fee_growth_a = pos.fee_growth_global_a;
+        let simulated_fee_growth_b = pos.fee_growth_global_b;
+
+        if (pos.total_share > 0) {
+            if (pending_fee_a > 0) {
+                simulated_fee_growth_a += math128::mul_div(
+                    pending_fee_a as u128,
+                    precision(),
+                    pos.total_share
+                );
+            };
+            if (pending_fee_b > 0) {
+                simulated_fee_growth_b += math128::mul_div(
+                    pending_fee_b as u128,
+                    precision(),
+                    pos.total_share
+                );
+            };
+        };
+
+        let fee_debt_a = deposit_slot::fee_growth_debt_a(deposit_slot);
+        let fee_debt_b = deposit_slot::fee_growth_debt_b(deposit_slot);
+
+        let total_fee_a =
+            if (simulated_fee_growth_a > fee_debt_a) {
+                math128::mul_div(
+                    simulated_fee_growth_a - fee_debt_a,
+                    share as u128,
+                    precision()
+                ) as u64
+            } else { 0 };
+
+        let total_fee_b =
+            if (simulated_fee_growth_b > fee_debt_b) {
+                math128::mul_div(
+                    simulated_fee_growth_b - fee_debt_b,
+                    share as u128,
+                    precision()
+                ) as u64
+            } else { 0 };
+
+        let pending_rewards = pool_v3::get_pending_rewards(pos.pos_object);
+        let reward_assets_count = pending_rewards.length();
+
+        (yield_amount, total_fee_a, total_fee_b, reward_assets_count)
+    }
+
+    #[view]
+    public fun calculate_loan_slot_yield(
+        pos_obj: Object<LoanPosition>, loan_slot: Object<LoanSlot>
+    ): (u128, u64, u64, u64) acquires LoanPosition {
+        let pos = borrow_loan_position(pos_obj);
+        let share = loan_slot::share(loan_slot);
+
+        if (share == 0 || pos.total_share == 0 || pos.liquidity == 0) {
+            return (0, 0, 0, 0)
+        };
+
+        let yield_amount = math128::mul_div(share, pos.liquidity, pos.total_share);
+        let pending_fee = pool_v3::get_pending_fees(pos.pos_object);
+        let pending_fee_a = pending_fee[0];
+        let pending_fee_b = pending_fee[1];
+
+        let simulated_fee_growth_a = pos.fee_growth_global_a;
+        let simulated_fee_growth_b = pos.fee_growth_global_b;
+
+        if (pos.total_share > 0) {
+            if (pending_fee_a > 0) {
+                simulated_fee_growth_a += math128::mul_div(
+                    pending_fee_a as u128,
+                    precision(),
+                    pos.total_share
+                );
+            };
+            if (pending_fee_b > 0) {
+                simulated_fee_growth_b += math128::mul_div(
+                    pending_fee_b as u128,
+                    precision(),
+                    pos.total_share
+                );
+            };
+        };
+
+        let fee_debt_a = loan_slot::fee_growth_debt_a(loan_slot);
+        let fee_debt_b = loan_slot::fee_growth_debt_b(loan_slot);
+
+        let total_fee_a =
+            if (simulated_fee_growth_a > fee_debt_a) {
+                math128::mul_div(
+                    simulated_fee_growth_a - fee_debt_a,
+                    share,
+                    precision()
+                ) as u64
+            } else { 0 };
+
+        let total_fee_b =
+            if (simulated_fee_growth_b > fee_debt_b) {
+                math128::mul_div(
+                    simulated_fee_growth_b - fee_debt_b,
+                    share,
+                    precision()
+                ) as u64
+            } else { 0 };
+
+        let pending_rewards = pool_v3::get_pending_rewards(pos.pos_object);
+        let reward_assets_count = pending_rewards.length();
+
+        (yield_amount, total_fee_a, total_fee_b, reward_assets_count)
+    }
+
     // === HELPER FUNCTIONS ===
+
+    /// Validate owner
+    fun assert_is_owner<T: key>(obj: Object<T>, owner: address) {
+        assert!(object::is_owner(obj, owner), E_NOT_OWNER);
+    }
 
     /// Validate loan position parameters
     fun assert_is_valid_loan_position_parameters(
